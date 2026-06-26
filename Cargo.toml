@@ -1,0 +1,13 @@
+[package]
+name = "archetype-install"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive TUI installer for Archetype Linux"
+license = "AGPL-3.0-only"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

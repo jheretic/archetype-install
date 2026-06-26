@@ -2,6 +2,7 @@
 //! the app, and restore the terminal on exit.
 
 mod app;
+mod disk;
 mod event;
 mod screens;
 mod theme;

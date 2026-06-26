@@ -7,8 +7,9 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 
+use crate::disk::{enumerate_disks, Disk};
 use crate::event::{AppEvent, EventLoop};
-use crate::screens::welcome;
+use crate::screens::{disk_select, welcome};
 use crate::tui::Tui;
 
 /// One step in the install wizard. Variants past [`Screen::Welcome`] are
@@ -36,10 +37,12 @@ pub enum Transition {
     Quit,
 }
 
-/// Install parameters accumulated across the wizard. Empty in Phase 2; later
-/// phases add the chosen disk and the root/swap/home size choices.
+/// Install parameters accumulated across the wizard. `target` is the disk
+/// chosen on DiskSelect; later phases add the root/swap/home size choices.
 #[derive(Default)]
-pub struct InstallConfig {}
+pub struct InstallConfig {
+    pub target: Option<Disk>,
+}
 
 /// Top-level application state. `dry_run` and `config` are populated now and
 /// consumed by later wizard phases.
@@ -47,8 +50,9 @@ pub struct App {
     pub screen: Screen,
     #[allow(dead_code)]
     pub dry_run: bool,
-    #[allow(dead_code)]
     pub config: InstallConfig,
+    pub disks: Vec<Disk>,
+    pub disk_cursor: usize,
     pub running: bool,
 }
 
@@ -58,6 +62,8 @@ impl App {
             screen: Screen::Welcome,
             dry_run,
             config: InstallConfig::default(),
+            disks: Vec::new(),
+            disk_cursor: 0,
             running: true,
         }
     }
@@ -78,6 +84,7 @@ impl App {
     fn draw(&self, frame: &mut ratatui::Frame) {
         match self.screen {
             Screen::Welcome => welcome::draw(frame),
+            Screen::DiskSelect => disk_select::draw(frame, self),
             _ => welcome::draw(frame),
         }
     }
@@ -85,6 +92,7 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) {
         let transition = match self.screen {
             Screen::Welcome => welcome::handle_key(key),
+            Screen::DiskSelect => disk_select::handle_key(self, key),
             _ => Transition::Stay,
         };
         self.apply(transition);
@@ -93,8 +101,36 @@ impl App {
     fn apply(&mut self, transition: Transition) {
         match transition {
             Transition::Quit => self.running = false,
-            Transition::Stay | Transition::Next | Transition::Back => {}
+            Transition::Back => self.go_back(),
+            Transition::Next => self.go_next(),
+            Transition::Stay => {}
         }
+    }
+
+    fn go_next(&mut self) {
+        self.screen = match self.screen {
+            Screen::Welcome => {
+                self.load_disks();
+                Screen::DiskSelect
+            }
+            Screen::DiskSelect => Screen::Sizing,
+            other => other,
+        };
+    }
+
+    fn go_back(&mut self) {
+        self.screen = match self.screen {
+            Screen::DiskSelect => Screen::Welcome,
+            Screen::Sizing => Screen::DiskSelect,
+            other => other,
+        };
+    }
+
+    /// Populate the disk list on entering DiskSelect. An enumeration failure
+    /// leaves the list empty so the screen shows its empty-state notice.
+    fn load_disks(&mut self) {
+        self.disks = enumerate_disks().unwrap_or_default();
+        self.disk_cursor = 0;
     }
 }
 

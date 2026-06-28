@@ -1,2 +1,6 @@
+pub mod confirm;
 pub mod disk_select;
+pub mod result;
+pub mod review;
+pub mod sizing;
 pub mod welcome;

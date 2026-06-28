@@ -9,8 +9,12 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::disk::{enumerate_disks, Disk};
 use crate::event::{AppEvent, EventLoop};
-use crate::screens::{disk_select, welcome};
+use crate::layout::{SizeChoice, Sizing};
+use crate::screens::review::ReviewState;
+use crate::screens::{confirm, disk_select, result, review, sizing, welcome};
 use crate::tui::Tui;
+
+const GIB: u64 = 1024 * 1024 * 1024;
 
 /// One step in the install wizard. Variants past [`Screen::Welcome`] are
 /// placeholders that later phases render and wire up.
@@ -38,21 +42,41 @@ pub enum Transition {
 }
 
 /// Install parameters accumulated across the wizard. `target` is the disk
-/// chosen on DiskSelect; later phases add the root/swap/home size choices.
-#[derive(Default)]
+/// chosen on DiskSelect; `sizing` is the root/swap/home allocation set on the
+/// Sizing screen.
 pub struct InstallConfig {
     pub target: Option<Disk>,
+    pub sizing: Sizing,
+}
+
+impl Default for InstallConfig {
+    /// root and swap start as adjustable fixed sizes; home grows to fill the
+    /// remaining free space.
+    fn default() -> Self {
+        Self {
+            target: None,
+            sizing: Sizing {
+                root: SizeChoice::Fixed(16 * GIB),
+                swap: Some(SizeChoice::Fixed(4 * GIB)),
+                home: SizeChoice::Grow {
+                    weight: 1000,
+                    min_bytes: 0,
+                },
+            },
+        }
+    }
 }
 
 /// Top-level application state. `dry_run` and `config` are populated now and
 /// consumed by later wizard phases.
 pub struct App {
     pub screen: Screen,
-    #[allow(dead_code)]
     pub dry_run: bool,
     pub config: InstallConfig,
     pub disks: Vec<Disk>,
     pub disk_cursor: usize,
+    pub sizing_cursor: usize,
+    pub review: Option<ReviewState>,
     pub running: bool,
 }
 
@@ -64,6 +88,8 @@ impl App {
             config: InstallConfig::default(),
             disks: Vec::new(),
             disk_cursor: 0,
+            sizing_cursor: 0,
+            review: None,
             running: true,
         }
     }
@@ -85,7 +111,11 @@ impl App {
         match self.screen {
             Screen::Welcome => welcome::draw(frame),
             Screen::DiskSelect => disk_select::draw(frame, self),
-            _ => welcome::draw(frame),
+            Screen::Sizing => sizing::draw(frame, self),
+            Screen::Review => review::draw(frame, self),
+            Screen::Confirm => confirm::draw(frame),
+            Screen::Result => result::draw(frame, self),
+            Screen::Progress => welcome::draw(frame),
         }
     }
 
@@ -93,7 +123,11 @@ impl App {
         let transition = match self.screen {
             Screen::Welcome => welcome::handle_key(key),
             Screen::DiskSelect => disk_select::handle_key(self, key),
-            _ => Transition::Stay,
+            Screen::Sizing => sizing::handle_key(self, key),
+            Screen::Review => review::handle_key(self, key),
+            Screen::Confirm => confirm::handle_key(key),
+            Screen::Result => result::handle_key(key),
+            Screen::Progress => Transition::Stay,
         };
         self.apply(transition);
     }
@@ -114,6 +148,14 @@ impl App {
                 Screen::DiskSelect
             }
             Screen::DiskSelect => Screen::Sizing,
+            Screen::Sizing => {
+                self.build_review();
+                Screen::Review
+            }
+            // Dry-run stops at Result without ever reaching Confirm/Progress;
+            // a real install would continue to the (Phase 6) Confirm screen.
+            Screen::Review if self.dry_run => Screen::Result,
+            Screen::Review => Screen::Confirm,
             other => other,
         };
     }
@@ -122,8 +164,20 @@ impl App {
         self.screen = match self.screen {
             Screen::DiskSelect => Screen::Welcome,
             Screen::Sizing => Screen::DiskSelect,
+            Screen::Review => Screen::Sizing,
+            Screen::Confirm => Screen::Review,
             other => other,
         };
+    }
+
+    /// Render the `repart.d` set for the chosen disk + sizing and (optionally)
+    /// run a guarded `systemd-repart --dry-run` for the Review screen.
+    fn build_review(&mut self) {
+        self.review = self
+            .config
+            .target
+            .as_ref()
+            .map(|disk| ReviewState::build(&self.config.sizing, disk.size_bytes, &disk.name));
     }
 
     /// Populate the disk list on entering DiskSelect. An enumeration failure

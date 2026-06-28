@@ -493,6 +493,13 @@ install as still needing an in-image confirmation pass.
   enrollment specifics and recovery-key UX.
 - A capability probe for Powerline glyph / truecolor support with graceful
   fallback on a non-kmscon console.
+- Stable target-disk identity: the chosen disk is currently a volatile `/dev/sdX`
+  kernel name, and the Confirm gate is string-equality on it. `/dev/sdX` can
+  re-point after hotplug/reprobe. Store + confirm a stable id (`/dev/disk/by-id`,
+  serial/WWN/model+size) and revalidate that the id still resolves to the same
+  non-live-medium disk immediately before `systemd-repart --empty=force`.
+  (P6 review should-fix; live-medium exclusion + exact-name confirm mitigate the
+  common case, but not a mid-session reprobe.)
 - The `archetype-install.service` unit and repart.d template corrections actually
   landing in archetype-build (this plan only recommends; that repo's change is a
   separate task).

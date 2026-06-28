@@ -1,25 +1,27 @@
 //! Application state machine: the wizard [`Screen`] enum, the shared
 //! [`InstallConfig`] accumulator, and the draw/update loop.
 //!
-//! Phase 2 only wires Welcome -> Quit. Later phases fill the remaining screens
-//! and the transitions between them.
+//! The flow is Welcome -> DiskSelect -> Sizing -> Review, then on a real
+//! install Confirm -> Progress -> Result (dry-run ends at Result directly).
+//! The destructive Progress step runs on a worker thread (see
+//! [`crate::install`]); the loop drains its channel on each tick.
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::disk::{enumerate_disks, Disk};
 use crate::event::{AppEvent, EventLoop};
+use crate::install::{self, Install, InstallPlan, Outcome, Progress};
 use crate::layout::{SizeChoice, Sizing};
+use crate::screens::progress::ProgressState;
 use crate::screens::review::ReviewState;
-use crate::screens::{confirm, disk_select, result, review, sizing, welcome};
+use crate::screens::{confirm, disk_select, progress, result, review, sizing, welcome};
 use crate::tui::Tui;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// One step in the install wizard. Variants past [`Screen::Welcome`] are
-/// placeholders that later phases render and wire up.
+/// One step in the install wizard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
 pub enum Screen {
     Welcome,
     DiskSelect,
@@ -31,14 +33,25 @@ pub enum Screen {
 }
 
 /// The result of handling input on a screen: how the wizard should move.
-/// `Next`/`Back` are part of the wizard vocabulary; Phase 2 only acts on `Quit`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
 pub enum Transition {
     Stay,
     Next,
     Back,
     Quit,
+}
+
+/// What the process should do after the event loop exits. Read by `main` once
+/// the terminal is restored, so a reboot never happens inside raw/alt-screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Exit {
+    /// Quit the installer (dry-run end, or shell drop after install).
+    #[default]
+    Quit,
+    /// `systemctl reboot` into the freshly installed system.
+    Reboot,
+    /// Leave the user at a console after install (success or recovery).
+    Shell,
 }
 
 /// Install parameters accumulated across the wizard. `target` is the disk
@@ -78,6 +91,11 @@ pub struct App {
     pub sizing_cursor: usize,
     pub review: Option<ReviewState>,
     pub running: bool,
+    pub confirm_input: String,
+    pub progress: ProgressState,
+    pub exit: Exit,
+    /// The running install worker, present only while on the Progress screen.
+    install: Option<Install>,
 }
 
 impl App {
@@ -91,6 +109,10 @@ impl App {
             sizing_cursor: 0,
             review: None,
             running: true,
+            confirm_input: String::new(),
+            progress: ProgressState::default(),
+            exit: Exit::Quit,
+            install: None,
         }
     }
 
@@ -100,7 +122,7 @@ impl App {
         while self.running {
             terminal.draw(|frame| self.draw(frame))?;
             match events.next()? {
-                AppEvent::Tick => {}
+                AppEvent::Tick => self.on_tick(),
                 AppEvent::Key(key) => self.handle_key(key),
             }
         }
@@ -113,9 +135,9 @@ impl App {
             Screen::DiskSelect => disk_select::draw(frame, self),
             Screen::Sizing => sizing::draw(frame, self),
             Screen::Review => review::draw(frame, self),
-            Screen::Confirm => confirm::draw(frame),
+            Screen::Confirm => confirm::draw(frame, self),
             Screen::Result => result::draw(frame, self),
-            Screen::Progress => welcome::draw(frame),
+            Screen::Progress => progress::draw(frame, self),
         }
     }
 
@@ -125,9 +147,9 @@ impl App {
             Screen::DiskSelect => disk_select::handle_key(self, key),
             Screen::Sizing => sizing::handle_key(self, key),
             Screen::Review => review::handle_key(self, key),
-            Screen::Confirm => confirm::handle_key(key),
-            Screen::Result => result::handle_key(key),
-            Screen::Progress => Transition::Stay,
+            Screen::Confirm => confirm::handle_key(self, key),
+            Screen::Result => result::handle_key(self, key),
+            Screen::Progress => progress::handle_key(),
         };
         self.apply(transition);
     }
@@ -152,12 +174,87 @@ impl App {
                 self.build_review();
                 Screen::Review
             }
-            // Dry-run stops at Result without ever reaching Confirm/Progress;
-            // a real install would continue to the (Phase 6) Confirm screen.
+            // Dry-run stops at Result without ever reaching Confirm/Progress.
             Screen::Review if self.dry_run => Screen::Result,
             Screen::Review => Screen::Confirm,
+            // Confirm only advances after its type-to-wipe gate passed. We
+            // re-authorize independently here: if the gate cannot be cleared
+            // (it always can at this point), stay on Confirm rather than risk
+            // an ungated jump into Progress.
+            Screen::Confirm => {
+                if self.start_install() {
+                    Screen::Progress
+                } else {
+                    Screen::Confirm
+                }
+            }
             other => other,
         };
+    }
+
+    /// Authorize and spawn the install worker. Returns false (staying on
+    /// Confirm) if the safety gate rejects, so Progress is unreachable without
+    /// an authorized [`InstallPlan`].
+    fn start_install(&mut self) -> bool {
+        let device = match self.config.target.as_ref() {
+            Some(disk) => disk.name.clone(),
+            None => return false,
+        };
+        match InstallPlan::authorize(self.dry_run, &device, &self.confirm_input) {
+            Some(plan) => {
+                self.progress = ProgressState::default();
+                self.install = Some(install::spawn(plan));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drain any queued progress messages on each tick so the worker thread
+    /// never blocks and the log stays current. On a terminal outcome, join the
+    /// worker and move to Result.
+    fn on_tick(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+
+        let Some(install) = self.install.as_ref() else {
+            return;
+        };
+        let mut finished = false;
+        loop {
+            match install.progress.try_recv() {
+                Ok(Progress::Step(step)) => self.progress.step = Some(step),
+                Ok(Progress::Line(line)) => self.progress.log.push(line),
+                Ok(Progress::Done(outcome)) => {
+                    self.progress.outcome = Some(outcome);
+                    finished = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                // The worker dropped the channel without a terminal Done
+                // (e.g. it panicked). Surface a failure rather than hang on
+                // Progress; the panic hook already restored the terminal.
+                Err(TryRecvError::Disconnected) => {
+                    if self.progress.outcome.is_none() {
+                        self.progress.outcome = Some(Outcome::Failed {
+                            step: self
+                                .progress
+                                .step
+                                .clone()
+                                .unwrap_or_else(|| "install".to_string()),
+                            error: "the install worker stopped unexpectedly".to_string(),
+                        });
+                    }
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if finished {
+            if let Some(mut install) = self.install.take() {
+                install.join();
+            }
+            self.screen = Screen::Result;
+        }
     }
 
     fn go_back(&mut self) {

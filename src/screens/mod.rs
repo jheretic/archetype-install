@@ -1,5 +1,6 @@
 pub mod confirm;
 pub mod disk_select;
+pub mod progress;
 pub mod result;
 pub mod review;
 pub mod sizing;

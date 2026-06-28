@@ -460,15 +460,25 @@ install mechanism.
 
 ---
 
-## 13. Weakest assumption
+## 13. Weakest assumption — RESOLVED (provisionally, by Phase 1 spike)
 
-`CopyBlocks=auto` will correctly resolve and block-clone the verity-backed (and
-signature) `/usr` partitions of a `root=tmpfs` live system onto the target,
-producing a bootable install — i.e. the stock `Format=squashfs` sysinstall
-templates are simply wrong for self-installation and the `CopyBlocks=auto` fix is
-sufficient. Everything downstream assumes this. **Unproven until the Phase 1
-spike runs on a real live boot.** Secondary: that the installed ESP, minus the
-installer addon, boots the normal target.
+`CopyBlocks=auto` correctly resolves and block-clones the verity-backed `/usr`
+partitions of a `root=tmpfs` live system onto the target, producing a bootable
+install. Confirmed against the spike's 5 questions (spike/repart-spike.sh):
+  1. CopyBlocks=auto resolves the live verity /usr data partition — YES
+  2. usr-verity hash rebuilt and validates — YES
+  3. usr-verity-sig — CLONES via CopyBlocks=auto (no re-signing / shipped keys
+     needed)
+  4. ESP excludes installer.addon.efi — YES
+  5. Installed image boots in a VM — YES
+
+So the corrected templates (Format=squashfs -> CopyBlocks=auto for the usr data
++ sig partitions) are the design of record, and Phases 4+ proceed on this basis.
+CAVEAT: confirmed via the user's reading, not a captured spike run in-image
+(getting the script into the image was the blocker). Re-validate end-to-end once
+the installer is built into the image and can run on a real boot (PLAN owner's
+note). Until then, treat the encrypted-root (TPM2) path and a true bootable
+install as still needing an in-image confirmation pass.
 
 ---
 

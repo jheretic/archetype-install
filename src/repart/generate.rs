@@ -151,7 +151,7 @@ mod tests {
             ),
             (
                 "20-usr-verity.conf",
-                "[Partition]\nType=usr-verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr\n",
+                "[Partition]\nType=usr-verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr\n# Clone the running verity hash partition block-for-block. repart will not\n# recompute the hash tree during a self-install; the live hash must be copied.\nCopyBlocks=auto\n",
             ),
             (
                 "30-usr-verity-sig.conf",
@@ -163,7 +163,7 @@ mod tests {
             ),
             (
                 "50-usr-verity-b.conf",
-                "[Partition]\nType=usr-verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr-b\n# Mirror of the A slot (20-usr-verity): no CopyBlocks. repart recomputes the\n# verity hash tree from the matching usr-b data partition (40-usr-b).\n",
+                "[Partition]\nType=usr-verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr-b\n# Mirror of the A slot (20-usr-verity): clone the running verity hash partition\n# block-for-block. The A/B updater replaces it on the first image update.\nCopyBlocks=auto\n",
             ),
             (
                 "60-usr-verity-sig-b.conf",

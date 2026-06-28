@@ -159,15 +159,15 @@ mod tests {
             ),
             (
                 "40-usr-b.conf",
-                "[Partition]\nType=usr\nSizeMinBytes=512M\nSizeMaxBytes=512M\nVerityMatchKey=usr-b\n# B slot: created empty (no CopyBlocks, no Format). Only the A slot is\n# populated at install; the A/B updater fills B on the first image update.\n",
+                "[Partition]\nType=usr\nSizeMinBytes=512M\nSizeMaxBytes=512M\nVerity=data\nVerityMatchKey=usr-b\n# Mirror of the A slot (10-usr): clone the running /usr block-for-block so the\n# installed system can boot from either slot immediately. The A/B updater\n# overwrites this on the first image update.\nCopyBlocks=auto\n",
             ),
             (
                 "50-usr-verity-b.conf",
-                "[Partition]\nType=usr-verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerityMatchKey=usr-b\n# B slot empty (no Verity=hash): there's no B data to hash at install time;\n# the A/B updater populates data+hash+sig together on the first update.\n",
+                "[Partition]\nType=usr-verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr-b\n# Mirror of the A slot (20-usr-verity): no CopyBlocks. repart recomputes the\n# verity hash tree from the matching usr-b data partition (40-usr-b).\n",
             ),
             (
                 "60-usr-verity-sig-b.conf",
-                "[Partition]\nType=usr-verity-sig\nVerityMatchKey=usr-b\n# B slot empty (no Verity=signature) — populated by the A/B updater.\n",
+                "[Partition]\nType=usr-verity-sig\nVerity=signature\nVerityMatchKey=usr-b\n# Mirror of the A slot (30-usr-verity-sig): clone the running signature\n# partition. The A/B updater replaces it on the first image update.\nCopyBlocks=auto\n",
             ),
         ])
     }

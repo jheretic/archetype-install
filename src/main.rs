@@ -4,6 +4,8 @@
 mod app;
 mod disk;
 mod event;
+mod layout;
+mod repart;
 mod screens;
 mod theme;
 mod tui;

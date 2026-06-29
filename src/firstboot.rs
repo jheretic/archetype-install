@@ -116,6 +116,17 @@ impl FirstbootConfig {
         format!("CHASSIS={}\n", self.chassis.as_str())
     }
 
+    /// The stdin line for `chpasswd -e` that sets root's password on the LIVE
+    /// system to the same hash applied to the target. `None` until a password
+    /// has been entered. Fed via stdin (not argv) so the hash never appears in
+    /// the process list. Newline-terminated.
+    pub fn live_root_chpasswd_entry(&self) -> Option<String> {
+        self.root_password_hash
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+            .map(|hash| format!("root:{hash}\n"))
+    }
+
     /// Whether every required text field is filled and the hostname is valid.
     /// Independent of the password, which the screen gates separately.
     pub fn fields_complete(&self) -> bool {
@@ -260,6 +271,19 @@ mod tests {
             ..FirstbootConfig::default()
         };
         assert_eq!(config.machine_info(), "CHASSIS=laptop\n");
+    }
+
+    #[test]
+    fn live_chpasswd_entry_present_only_with_a_hash() {
+        let mut config = FirstbootConfig::default();
+        assert_eq!(config.live_root_chpasswd_entry(), None);
+        config.root_password_hash = Some("$6$salt$hash".to_string());
+        assert_eq!(
+            config.live_root_chpasswd_entry().as_deref(),
+            Some("root:$6$salt$hash\n")
+        );
+        config.root_password_hash = Some(String::new());
+        assert_eq!(config.live_root_chpasswd_entry(), None);
     }
 
     #[test]

@@ -71,13 +71,14 @@ impl SizeChoice {
     }
 }
 
-/// A user's size choices for the three configurable partitions. `swap` is
-/// optional; `root` and `home` are always present.
+/// A user's size choices for the three configurable partitions. `swap` and
+/// `home` are optional (an omitted one leaves its space as free GPT space);
+/// `root` is always present.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sizing {
     pub root: SizeChoice,
     pub swap: Option<SizeChoice>,
-    pub home: SizeChoice,
+    pub home: Option<SizeChoice>,
 }
 
 impl Default for Sizing {
@@ -90,10 +91,10 @@ impl Default for Sizing {
                 weight: 333,
                 min_bytes: 64 * MIB,
             }),
-            home: SizeChoice::Grow {
+            home: Some(SizeChoice::Grow {
                 weight: 1000,
                 min_bytes: 0,
-            },
+            }),
         }
     }
 }
@@ -103,7 +104,7 @@ impl Default for Sizing {
 pub struct ConfigurablePartitions {
     pub root: PartitionDef,
     pub swap: Option<PartitionDef>,
-    pub home: PartitionDef,
+    pub home: Option<PartitionDef>,
 }
 
 /// A reason a [`Sizing`] cannot be realised on a given disk.
@@ -184,7 +185,7 @@ pub fn plan(sizing: &Sizing, disk_bytes: u64) -> Result<ConfigurablePartitions, 
 
     let requested_bytes = root_committed
         + sizing.swap.map_or(0, SizeChoice::committed_bytes)
-        + sizing.home.committed_bytes();
+        + sizing.home.map_or(0, SizeChoice::committed_bytes);
     if requested_bytes > available_bytes {
         return Err(LayoutError::OverAllocated {
             requested_bytes,
@@ -210,7 +211,9 @@ pub fn plan(sizing: &Sizing, disk_bytes: u64) -> Result<ConfigurablePartitions, 
                 choice,
             )
         }),
-        home: build(PartitionDef::new("home"), sizing.home),
+        home: sizing
+            .home
+            .map(|choice| build(PartitionDef::new("home"), choice)),
     })
 }
 
@@ -249,8 +252,19 @@ mod tests {
         assert_eq!(plan.root.size_min_bytes, Some(GIB));
         assert_eq!(plan.root.size_max_bytes, Some(GIB));
         assert_eq!(plan.swap.as_ref().unwrap().weight, Some(333));
-        assert_eq!(plan.home.weight, Some(1000));
-        assert_eq!(plan.home.size_max_bytes, None);
+        let home = plan.home.as_ref().unwrap();
+        assert_eq!(home.weight, Some(1000));
+        assert_eq!(home.size_max_bytes, None);
+    }
+
+    #[test]
+    fn omits_home_partition_when_home_is_none() {
+        let sizing = Sizing {
+            home: None,
+            ..Sizing::default()
+        };
+        let plan = plan(&sizing, DISK_512G).unwrap();
+        assert!(plan.home.is_none());
     }
 
     #[test]
@@ -258,14 +272,15 @@ mod tests {
         let sizing = Sizing {
             root: SizeChoice::Fixed(4 * GIB),
             swap: None,
-            home: SizeChoice::Fixed(100 * GIB),
+            home: Some(SizeChoice::Fixed(100 * GIB)),
         };
         let plan = plan(&sizing, DISK_512G).unwrap();
         assert_eq!(plan.root.size_min_bytes, Some(4 * GIB));
         assert_eq!(plan.root.size_max_bytes, Some(4 * GIB));
         assert!(plan.swap.is_none());
-        assert_eq!(plan.home.size_min_bytes, Some(100 * GIB));
-        assert_eq!(plan.home.size_max_bytes, Some(100 * GIB));
+        let home = plan.home.as_ref().unwrap();
+        assert_eq!(home.size_min_bytes, Some(100 * GIB));
+        assert_eq!(home.size_max_bytes, Some(100 * GIB));
     }
 
     #[test]
@@ -273,15 +288,16 @@ mod tests {
         let sizing = Sizing {
             root: SizeChoice::Fixed(2 * GIB),
             swap: None,
-            home: SizeChoice::Grow {
+            home: Some(SizeChoice::Grow {
                 weight: 500,
                 min_bytes: 10 * GIB,
-            },
+            }),
         };
         let plan = plan(&sizing, DISK_512G).unwrap();
-        assert_eq!(plan.home.size_min_bytes, Some(10 * GIB));
-        assert_eq!(plan.home.size_max_bytes, None);
-        assert_eq!(plan.home.weight, Some(500));
+        let home = plan.home.as_ref().unwrap();
+        assert_eq!(home.size_min_bytes, Some(10 * GIB));
+        assert_eq!(home.size_max_bytes, None);
+        assert_eq!(home.weight, Some(500));
     }
 
     #[test]
@@ -289,7 +305,7 @@ mod tests {
         let sizing = Sizing {
             root: SizeChoice::Fixed(400 * GIB),
             swap: Some(SizeChoice::Fixed(100 * GIB)),
-            home: SizeChoice::Fixed(100 * GIB),
+            home: Some(SizeChoice::Fixed(100 * GIB)),
         };
         let err = plan(&sizing, DISK_512G).unwrap_err();
         match err {
@@ -309,10 +325,10 @@ mod tests {
         let sizing = Sizing {
             root: SizeChoice::Fixed(512 * MIB),
             swap: None,
-            home: SizeChoice::Grow {
+            home: Some(SizeChoice::Grow {
                 weight: 1000,
                 min_bytes: 0,
-            },
+            }),
         };
         let err = plan(&sizing, DISK_512G).unwrap_err();
         assert_eq!(
@@ -332,10 +348,10 @@ mod tests {
                 min_bytes: ROOT_MIN_BYTES,
             },
             swap: None,
-            home: SizeChoice::Grow {
+            home: Some(SizeChoice::Grow {
                 weight: 1000,
                 min_bytes: DISK_512G,
-            },
+            }),
         };
         let err = plan(&sizing, DISK_512G).unwrap_err();
         assert!(matches!(err, LayoutError::OverAllocated { .. }));

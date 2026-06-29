@@ -13,9 +13,12 @@ use crate::disk::{enumerate_disks, Disk};
 use crate::event::{AppEvent, EventLoop};
 use crate::install::{self, Install, InstallPlan, Outcome, Progress};
 use crate::layout::{SizeChoice, Sizing};
+use crate::preflight::{self, PreflightResult};
 use crate::screens::progress::ProgressState;
 use crate::screens::review::ReviewState;
-use crate::screens::{confirm, disk_select, progress, result, review, sizing, welcome};
+use crate::screens::{
+    confirm, disk_select, preflight as preflight_screen, progress, result, review, sizing, welcome,
+};
 use crate::tui::Tui;
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -23,6 +26,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// One step in the install wizard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
+    Preflight,
     Welcome,
     DiskSelect,
     Sizing,
@@ -71,10 +75,10 @@ impl Default for InstallConfig {
             sizing: Sizing {
                 root: SizeChoice::Fixed(16 * GIB),
                 swap: Some(SizeChoice::Fixed(4 * GIB)),
-                home: SizeChoice::Grow {
+                home: Some(SizeChoice::Grow {
                     weight: 1000,
                     min_bytes: 0,
-                },
+                }),
             },
         }
     }
@@ -90,6 +94,8 @@ pub struct App {
     pub disk_cursor: usize,
     pub sizing_cursor: usize,
     pub review: Option<ReviewState>,
+    /// The startup TPM2 preflight verdict, read by the Preflight screen.
+    pub preflight: Option<PreflightResult>,
     pub running: bool,
     pub confirm_input: String,
     pub progress: ProgressState,
@@ -100,14 +106,23 @@ pub struct App {
 
 impl App {
     pub fn new(dry_run: bool) -> Self {
+        // The TPM2 check runs once at startup. A pass skips straight to Welcome;
+        // a failure lands on Preflight (a hard stop, or a dry-run warning).
+        let preflight = preflight::check();
+        let screen = if preflight.ok {
+            Screen::Welcome
+        } else {
+            Screen::Preflight
+        };
         Self {
-            screen: Screen::Welcome,
+            screen,
             dry_run,
             config: InstallConfig::default(),
             disks: Vec::new(),
             disk_cursor: 0,
             sizing_cursor: 0,
             review: None,
+            preflight: Some(preflight),
             running: true,
             confirm_input: String::new(),
             progress: ProgressState::default(),
@@ -131,6 +146,7 @@ impl App {
 
     fn draw(&self, frame: &mut ratatui::Frame) {
         match self.screen {
+            Screen::Preflight => preflight_screen::draw(frame, self),
             Screen::Welcome => welcome::draw(frame),
             Screen::DiskSelect => disk_select::draw(frame, self),
             Screen::Sizing => sizing::draw(frame, self),
@@ -143,6 +159,7 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) {
         let transition = match self.screen {
+            Screen::Preflight => preflight_screen::handle_key(self, key),
             Screen::Welcome => welcome::handle_key(key),
             Screen::DiskSelect => disk_select::handle_key(self, key),
             Screen::Sizing => sizing::handle_key(self, key),
@@ -165,6 +182,8 @@ impl App {
 
     fn go_next(&mut self) {
         self.screen = match self.screen {
+            // Only reachable in dry-run (a real TPM2 failure offers no advance).
+            Screen::Preflight => Screen::Welcome,
             Screen::Welcome => {
                 self.load_disks();
                 Screen::DiskSelect

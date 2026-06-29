@@ -97,10 +97,12 @@ pub fn render_set(
             contents: swap.render(),
         });
     }
-    files.push(RenderedFile {
-        filename: "90-home.conf".to_string(),
-        contents: home.render(),
-    });
+    if let Some(home) = home {
+        files.push(RenderedFile {
+            filename: "90-home.conf".to_string(),
+            contents: home.render(),
+        });
+    }
 
     Ok(files)
 }
@@ -229,6 +231,18 @@ mod tests {
         let files =
             render_set(&sizing, 512 * 1024 * 1024 * 1024, Path::new("/nonexistent")).unwrap();
         assert!(files.iter().all(|f| f.filename != "80-swap.conf"));
+        assert_eq!(files.len(), 9);
+    }
+
+    #[test]
+    fn omits_home_file_when_home_is_none() {
+        let sizing = Sizing {
+            home: None,
+            ..Sizing::default()
+        };
+        let files =
+            render_set(&sizing, 512 * 1024 * 1024 * 1024, Path::new("/nonexistent")).unwrap();
+        assert!(files.iter().all(|f| f.filename != "90-home.conf"));
         assert_eq!(files.len(), 9);
     }
 

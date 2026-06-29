@@ -59,6 +59,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
             toggle_swap(&mut app.config.sizing);
             Transition::Stay
         }
+        KeyCode::Char('o') => {
+            toggle_home(&mut app.config.sizing);
+            Transition::Stay
+        }
         KeyCode::Enter if is_valid(app) => Transition::Next,
         _ => Transition::Stay,
     }
@@ -121,6 +125,18 @@ fn toggle_swap(sizing: &mut Sizing) {
     };
 }
 
+/// Toggle the home partition. When off, its space is left as free GPT space for
+/// the user to partition later; when restored, it grows to fill the remainder.
+fn toggle_home(sizing: &mut Sizing) {
+    sizing.home = match sizing.home {
+        Some(_) => None,
+        None => Some(SizeChoice::Grow {
+            weight: 1000,
+            min_bytes: 0,
+        }),
+    };
+}
+
 /// Whether the current sizing validates against the chosen disk.
 fn is_valid(app: &App) -> bool {
     app.config
@@ -174,12 +190,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
         choice_bytes(sizing.root),
     );
     draw_swap(frame, rows[1], app);
-    draw_home(frame, rows[2], remaining);
+    draw_home(frame, rows[2], app, remaining);
     draw_gauge(frame, rows[4], committed, available);
     draw_status(frame, rows[5], app, available);
 
     frame.render_widget(
-        Paragraph::new(hint(sizing.swap.is_some())).alignment(Alignment::Center),
+        Paragraph::new(hint(sizing.swap.is_some(), sizing.home.is_some()))
+            .alignment(Alignment::Center),
         rows[6],
     );
 }
@@ -201,18 +218,29 @@ fn draw_swap(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(field_line("swap", &value, selected)), area);
 }
 
-fn draw_home(frame: &mut Frame, area: Rect, remaining: u64) {
-    let line = Line::from(vec![
-        Span::styled("    home  ", Style::default().fg(theme::FG)),
-        Span::styled(
-            format!("{} ", human_bytes(remaining)),
-            Style::default().fg(theme::CYAN),
-        ),
-        Span::styled(
-            "(grows to fill remaining)",
-            Style::default().fg(theme::BRIGHT_BLACK),
-        ),
-    ]);
+fn draw_home(frame: &mut Frame, area: Rect, app: &App, remaining: u64) {
+    let line = if app.config.sizing.home.is_some() {
+        Line::from(vec![
+            Span::styled("    home  ", Style::default().fg(theme::FG)),
+            Span::styled(
+                format!("{} ", human_bytes(remaining)),
+                Style::default().fg(theme::CYAN),
+            ),
+            Span::styled(
+                "(grows to fill remaining)",
+                Style::default().fg(theme::BRIGHT_BLACK),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("    home  ", Style::default().fg(theme::FG)),
+            Span::styled("disabled ", Style::default().fg(theme::CYAN)),
+            Span::styled(
+                "(remaining left as free space)",
+                Style::default().fg(theme::BRIGHT_BLACK),
+            ),
+        ])
+    };
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -261,13 +289,16 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, available: u64) {
         .as_ref()
         .map(|disk| layout::plan(&app.config.sizing, disk.size_bytes))
     {
-        Some(Ok(_)) => Line::from(Span::styled(
-            format!(
-                "{} free for home",
-                human_bytes(available.saturating_sub(committed_bytes(&app.config.sizing)))
-            ),
-            Style::default().fg(theme::GREEN),
-        )),
+        Some(Ok(_)) => {
+            let remaining =
+                human_bytes(available.saturating_sub(committed_bytes(&app.config.sizing)));
+            let summary = if app.config.sizing.home.is_some() {
+                format!("{remaining} free for home")
+            } else {
+                format!("{remaining} left as free space")
+            };
+            Line::from(Span::styled(summary, Style::default().fg(theme::GREEN)))
+        }
         Some(Err(err)) => Line::from(Span::styled(
             err.to_string(),
             Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
@@ -280,7 +311,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, available: u64) {
     frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
 }
 
-fn hint(swap_enabled: bool) -> Line<'static> {
+fn hint(swap_enabled: bool, home_enabled: bool) -> Line<'static> {
     let key = |label: &'static str, color| {
         Span::styled(
             label,
@@ -299,6 +330,12 @@ fn hint(swap_enabled: bool) -> Line<'static> {
             " swap off   "
         } else {
             " swap on   "
+        }),
+        key("o", theme::YELLOW),
+        text(if home_enabled {
+            " home off   "
+        } else {
+            " home on   "
         }),
         key("Enter", theme::GREEN),
         text(" next   "),
@@ -390,5 +427,23 @@ mod tests {
         assert_eq!(sizing.swap.is_some(), !had_swap);
         toggle_swap(&mut sizing);
         assert_eq!(sizing.swap.is_some(), had_swap);
+    }
+
+    #[test]
+    fn toggle_home_round_trips() {
+        let mut sizing = Sizing::default();
+        let had_home = sizing.home.is_some();
+        toggle_home(&mut sizing);
+        assert_eq!(sizing.home.is_some(), !had_home);
+        toggle_home(&mut sizing);
+        assert_eq!(sizing.home.is_some(), had_home);
+    }
+
+    #[test]
+    fn sizing_is_valid_with_home_omitted() {
+        let mut app = app_with_disk(DISK_512G);
+        toggle_home(&mut app.config.sizing);
+        assert!(app.config.sizing.home.is_none());
+        assert!(is_valid(&app));
     }
 }

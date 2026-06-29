@@ -1,8 +1,9 @@
 //! Application state machine: the wizard [`Screen`] enum, the shared
 //! [`InstallConfig`] accumulator, and the draw/update loop.
 //!
-//! The flow is Welcome -> DiskSelect -> Sizing -> Review, then on a real
-//! install Confirm -> Progress -> Result (dry-run ends at Result directly).
+//! The flow is Welcome -> Config -> DiskSelect -> Sizing -> Review, then on a
+//! real install Confirm -> Progress -> Result (dry-run ends at Result
+//! directly).
 //! The destructive Progress step runs on a worker thread (see
 //! [`crate::install`]); the loop drains its channel on each tick.
 
@@ -11,13 +12,15 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::disk::{enumerate_disks, Disk};
 use crate::event::{AppEvent, EventLoop};
+use crate::firstboot::FirstbootConfig;
 use crate::install::{self, Install, InstallPlan, Outcome, Progress};
 use crate::layout::{SizeChoice, Sizing};
 use crate::preflight::{self, PreflightResult};
 use crate::screens::progress::ProgressState;
 use crate::screens::review::ReviewState;
 use crate::screens::{
-    confirm, disk_select, preflight as preflight_screen, progress, result, review, sizing, welcome,
+    confirm, disk_select, firstboot as firstboot_screen, preflight as preflight_screen, progress,
+    result, review, sizing, welcome,
 };
 use crate::tui::Tui;
 
@@ -28,6 +31,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 pub enum Screen {
     Preflight,
     Welcome,
+    Config,
     DiskSelect,
     Sizing,
     Review,
@@ -64,6 +68,7 @@ pub enum Exit {
 pub struct InstallConfig {
     pub target: Option<Disk>,
     pub sizing: Sizing,
+    pub firstboot: FirstbootConfig,
 }
 
 impl Default for InstallConfig {
@@ -80,6 +85,7 @@ impl Default for InstallConfig {
                     min_bytes: 0,
                 }),
             },
+            firstboot: FirstbootConfig::default(),
         }
     }
 }
@@ -93,6 +99,10 @@ pub struct App {
     pub disks: Vec<Disk>,
     pub disk_cursor: usize,
     pub sizing_cursor: usize,
+    pub firstboot_cursor: usize,
+    /// Masked root password entry; never persisted. Cleared after hashing.
+    pub password: String,
+    pub password_confirm: String,
     pub review: Option<ReviewState>,
     /// The startup TPM2 preflight verdict, read by the Preflight screen.
     pub preflight: Option<PreflightResult>,
@@ -121,6 +131,9 @@ impl App {
             disks: Vec::new(),
             disk_cursor: 0,
             sizing_cursor: 0,
+            firstboot_cursor: 0,
+            password: String::new(),
+            password_confirm: String::new(),
             review: None,
             preflight: Some(preflight),
             running: true,
@@ -148,6 +161,7 @@ impl App {
         match self.screen {
             Screen::Preflight => preflight_screen::draw(frame, self),
             Screen::Welcome => welcome::draw(frame),
+            Screen::Config => firstboot_screen::draw(frame, self),
             Screen::DiskSelect => disk_select::draw(frame, self),
             Screen::Sizing => sizing::draw(frame, self),
             Screen::Review => review::draw(frame, self),
@@ -161,6 +175,7 @@ impl App {
         let transition = match self.screen {
             Screen::Preflight => preflight_screen::handle_key(self, key),
             Screen::Welcome => welcome::handle_key(key),
+            Screen::Config => firstboot_screen::handle_key(self, key),
             Screen::DiskSelect => disk_select::handle_key(self, key),
             Screen::Sizing => sizing::handle_key(self, key),
             Screen::Review => review::handle_key(self, key),
@@ -184,7 +199,8 @@ impl App {
         self.screen = match self.screen {
             // Only reachable in dry-run (a real TPM2 failure offers no advance).
             Screen::Preflight => Screen::Welcome,
-            Screen::Welcome => {
+            Screen::Welcome => Screen::Config,
+            Screen::Config => {
                 self.load_disks();
                 Screen::DiskSelect
             }
@@ -278,7 +294,8 @@ impl App {
 
     fn go_back(&mut self) {
         self.screen = match self.screen {
-            Screen::DiskSelect => Screen::Welcome,
+            Screen::Config => Screen::Welcome,
+            Screen::DiskSelect => Screen::Config,
             Screen::Sizing => Screen::DiskSelect,
             Screen::Review => Screen::Sizing,
             Screen::Confirm => Screen::Review,

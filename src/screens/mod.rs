@@ -1,5 +1,6 @@
 pub mod confirm;
 pub mod disk_select;
+pub mod firstboot;
 pub mod preflight;
 pub mod progress;
 pub mod result;

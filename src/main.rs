@@ -4,6 +4,7 @@
 mod app;
 mod disk;
 mod event;
+mod firstboot;
 mod install;
 mod layout;
 mod preflight;

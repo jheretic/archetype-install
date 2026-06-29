@@ -193,8 +193,8 @@ fn mount_and_seed(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(),
     log(tx, &format!("root partition: {root}"));
     warn(
         tx,
-        "root is Encrypt=key-file+tpm2; unlocking via the TPM2-enrolled key \
-         is UNVERIFIED here. TODO: wire cryptsetup/systemd-cryptsetup unlock \
+        "root is Encrypt=tpm2; unlocking via the TPM2-enrolled key is \
+         UNVERIFIED here. TODO: wire cryptsetup/systemd-cryptsetup unlock \
          before mount. Attempting a plain mount (expected to fail on LUKS).",
     );
     if !try_mount(tx, root, root_mount) {

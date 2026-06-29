@@ -64,13 +64,13 @@ impl CopyBlocks {
 /// `Encrypt=` mode for the partition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encrypt {
-    KeyFileTpm2,
+    Tpm2,
 }
 
 impl Encrypt {
     fn as_str(self) -> &'static str {
         match self {
-            Encrypt::KeyFileTpm2 => "key-file+tpm2",
+            Encrypt::Tpm2 => "tpm2",
         }
     }
 }
@@ -145,7 +145,7 @@ mod tests {
             size_min_bytes: Some(2147483648),
             size_max_bytes: Some(2147483648),
             format: Some(Format::Btrfs),
-            encrypt: Some(Encrypt::KeyFileTpm2),
+            encrypt: Some(Encrypt::Tpm2),
             ..PartitionDef::new("root")
         };
         assert_eq!(
@@ -155,7 +155,7 @@ mod tests {
              SizeMinBytes=2147483648\n\
              SizeMaxBytes=2147483648\n\
              Format=btrfs\n\
-             Encrypt=key-file+tpm2\n"
+             Encrypt=tpm2\n"
         );
     }
 

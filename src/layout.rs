@@ -196,7 +196,7 @@ pub fn plan(sizing: &Sizing, disk_bytes: u64) -> Result<ConfigurablePartitions, 
         root: build(
             PartitionDef {
                 format: Some(Format::Btrfs),
-                encrypt: Some(Encrypt::KeyFileTpm2),
+                encrypt: Some(Encrypt::Tpm2),
                 ..PartitionDef::new("root")
             },
             sizing.root,

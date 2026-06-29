@@ -6,6 +6,7 @@ mod disk;
 mod event;
 mod install;
 mod layout;
+mod preflight;
 mod repart;
 mod screens;
 mod theme;

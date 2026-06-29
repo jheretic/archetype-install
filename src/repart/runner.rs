@@ -57,13 +57,16 @@ impl RepartOutcome {
 
 /// Build the `systemd-repart` argument vector for `mode` against `device`,
 /// using the definitions in `definitions_dir`. `--empty=force` is always
-/// passed: the target is wiped and repartitioned from scratch. `--json=pretty`
-/// is requested only for [`Mode::DryRun`] (callers display the computed plan);
-/// the execute path streams human-readable progress instead.
+/// passed: the target is wiped and repartitioned from scratch. `--tpm2-device=auto`
+/// is always passed so the root partition's `Encrypt=tpm2` keyslot can enroll
+/// against the local TPM2 (no key-file fallback exists); it is inert in dry-run.
+/// `--json=pretty` is requested only for [`Mode::DryRun`] (callers display the
+/// computed plan); the execute path streams human-readable progress instead.
 pub fn build_args(mode: Mode, definitions_dir: &Path, device: &str) -> Vec<String> {
     let mut args = vec![
         mode.dry_run_flag().to_string(),
         "--empty=force".to_string(),
+        "--tpm2-device=auto".to_string(),
         format!("--definitions={}", definitions_dir.display()),
     ];
     if mode == Mode::DryRun {
@@ -183,6 +186,7 @@ mod tests {
             [
                 "--dry-run=yes",
                 "--empty=force",
+                "--tpm2-device=auto",
                 "--definitions=/run/archetype-install/repart.d",
                 "--json=pretty",
                 "/dev/sdb",
@@ -202,6 +206,7 @@ mod tests {
             [
                 "--dry-run=no",
                 "--empty=force",
+                "--tpm2-device=auto",
                 "--definitions=/run/archetype-install/repart.d",
                 "/dev/sdb",
             ]

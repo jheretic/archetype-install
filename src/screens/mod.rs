@@ -3,6 +3,7 @@ pub mod disk_select;
 pub mod firstboot;
 pub mod preflight;
 pub mod progress;
+pub mod recovery;
 pub mod result;
 pub mod review;
 pub mod sizing;

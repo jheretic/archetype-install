@@ -40,6 +40,29 @@ const ROOT_VOLUME: &str = "archetype-root";
 /// `systemd-cryptsetup` is not on `PATH`; it ships at this fixed location.
 const CRYPTSETUP_BIN: &str = "/usr/lib/systemd/systemd-cryptsetup";
 
+/// The device-mapper name for the unlocked dm-integrity home volume; it appears
+/// at `/dev/mapper/<HOME_VOLUME>`. The same name is used as the integritytab
+/// volume name so the boot-time generator re-creates the identical mapper.
+const HOME_VOLUME: &str = "home";
+
+/// HMAC-SHA256 integrity key length, in bytes. integritysetup(8) caps key files
+/// at 4096 bytes; 32 bytes (256 bits) matches the HMAC-SHA256 output size.
+const HOME_KEY_SIZE: usize = 32;
+
+/// dm-integrity tag size, in bytes. integritysetup(8)'s HMAC-SHA256 example uses
+/// `--tag-size 32` (the full SHA-256 digest).
+const HOME_TAG_SIZE: usize = 32;
+
+/// Boot-time path of the home integrity key, relative to the installed root.
+/// integritytab(5) references this absolute path; at install time the same file
+/// lives under `<target>` (see [`home_key_install_path`]).
+const HOME_KEY_BOOT_PATH: &str = "/etc/integritysetup-keys.d/home.key";
+
+/// GPT partition label of the home partition (set `Label=HOME` by repart). The
+/// integritytab line references it as `PARTLABEL=HOME` so the volume is found
+/// independent of the device node.
+const HOME_PARTLABEL: &str = "HOME";
+
 /// A message from the install worker to the Progress screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Progress {
@@ -47,6 +70,9 @@ pub enum Progress {
     Step(String),
     /// A log line (repart output, command output, or a note).
     Line(String),
+    /// The recovery key enrolled on the encrypted root. Surfaced so the UI can
+    /// display it (with a QR code) and block reboot until the user saves it.
+    RecoveryKey(String),
     /// Terminal message: the install finished (succeeded or failed).
     Done(Outcome),
 }
@@ -72,6 +98,10 @@ pub struct InstallPlan {
     device: String,
     definitions_dir: PathBuf,
     firstboot: FirstbootConfig,
+    /// Whether the user requested a home partition (Sizing.home is Some). The
+    /// dm-integrity home setup runs only when this is true AND a HOME partition
+    /// is actually found on the target.
+    home_requested: bool,
 }
 
 impl InstallPlan {
@@ -83,6 +113,7 @@ impl InstallPlan {
         chosen_device: &str,
         typed_name: &str,
         firstboot: FirstbootConfig,
+        home_requested: bool,
     ) -> Option<Self> {
         if dry_run {
             return None;
@@ -97,6 +128,7 @@ impl InstallPlan {
             device: chosen_device.to_string(),
             definitions_dir: PathBuf::from(OUTPUT_DIR),
             firstboot,
+            home_requested,
         })
     }
 }
@@ -187,12 +219,143 @@ fn post_steps(plan: &InstallPlan, tx: &Sender<Progress>) -> Result<(), String> {
     mount_and_seed(&parts, tx)?;
     let root_mount = Path::new(TARGET_MOUNT);
     let rest = apply_firstboot(&plan.firstboot, root_mount, tx)
-        .and_then(|()| write_machine_info(&plan.firstboot, root_mount, tx));
+        .and_then(|()| write_machine_info(&plan.firstboot, root_mount, tx))
+        .and_then(|()| integrity_home(plan, &parts, root_mount, tx))
+        .and_then(|()| {
+            let root = parts
+                .root
+                .as_ref()
+                .ok_or_else(|| "root partition vanished before recovery enrollment".to_string())?;
+            enroll_recovery_key(root, tx)
+        });
     if let Err(detail) = rest {
         detach_root(tx);
         return Err(detail);
     }
     bootloader_note(tx);
+    Ok(())
+}
+
+/// Set up the home partition as a keyed (HMAC-SHA256) dm-integrity volume, lay
+/// btrfs on the resulting mapper, and record it in `/etc/integritytab` +
+/// `/etc/fstab` on the target so it is reassembled at every boot. Runs only when
+/// the user requested home AND a HOME partition was actually found; a missing
+/// partition when home was requested is a required-step failure. Any failure
+/// past `integritysetup open` closes the mapper before returning so no open
+/// integrity device is leaked onto the recovery console.
+fn integrity_home(
+    plan: &InstallPlan,
+    parts: &TargetPartitions,
+    root_mount: &Path,
+    tx: &Sender<Progress>,
+) -> Result<(), String> {
+    if !plan.home_requested {
+        return Ok(());
+    }
+    let _ = tx.send(Progress::Step(
+        "Setting up encrypted home (dm-integrity)".to_string(),
+    ));
+    let home = parts.home.as_ref().ok_or_else(|| {
+        "home was requested but no HOME partition was found on the target".to_string()
+    })?;
+    log(tx, &format!("home partition: {home}"));
+
+    let key = generate_integrity_key()?;
+    let key_path = home_key_install_path(root_mount);
+    write_integrity_key(&key_path, &key)?;
+    log(
+        tx,
+        &format!("wrote integrity key {} (0600)", key_path.display()),
+    );
+
+    let format_args = integritysetup_format_args(home, &key_path, HOME_KEY_SIZE, HOME_TAG_SIZE);
+    let format_refs: Vec<&str> = format_args.iter().map(String::as_str).collect();
+    if !run_cmd(tx, "integritysetup", &format_refs) {
+        return Err(format!(
+            "integritysetup could not format the home partition {home}"
+        ));
+    }
+
+    let open_args = integritysetup_open_args(home, &key_path, HOME_KEY_SIZE, HOME_VOLUME);
+    let open_refs: Vec<&str> = open_args.iter().map(String::as_str).collect();
+    if !run_cmd(tx, "integritysetup", &open_refs) {
+        return Err(format!(
+            "integritysetup could not open the home integrity volume on {home}"
+        ));
+    }
+    // The integrity mapper is now OPEN. Any failure below must close it.
+    let mapper = format!("/dev/mapper/{HOME_VOLUME}");
+    if !run_cmd(tx, "mkfs.btrfs", &[&mapper]) {
+        let _ = detach_home(tx);
+        return Err(format!("could not create a btrfs filesystem on {mapper}"));
+    }
+
+    if let Err(detail) = append_line(&root_mount.join("etc/integritytab"), &integritytab_line()) {
+        let _ = detach_home(tx);
+        return Err(detail);
+    }
+    if let Err(detail) = append_line(&root_mount.join("etc/fstab"), &home_fstab_line()) {
+        let _ = detach_home(tx);
+        return Err(detail);
+    }
+    // Leave the mapper closed for the rest of the install; boot re-opens it from
+    // integritytab. Closing also avoids a stale mapper colliding at next boot.
+    // On the success path a failed close is NOT best-effort: a left-open mapper
+    // would collide at next boot, so report Incomplete.
+    if !detach_home(tx) {
+        return Err(format!(
+            "set up home but could not close /dev/mapper/{HOME_VOLUME}; \
+             close it before rebooting (recoverable, no reboot)"
+        ));
+    }
+    Ok(())
+}
+
+/// Close the opened home integrity mapper. Returns true on success. On error
+/// cleanup paths the boolean is ignored (best-effort); on the success path the
+/// caller treats a failure as [`Outcome::Incomplete`].
+fn detach_home(tx: &Sender<Progress>) -> bool {
+    run_cmd(tx, "integritysetup", &["close", HOME_VOLUME])
+}
+
+/// Enroll a recovery key on the encrypted root via `systemd-cryptenroll
+/// --recovery-key`, unlocking with the already-enrolled TPM2 keyslot. The
+/// recovery key string is parsed from stdout and emitted as
+/// [`Progress::RecoveryKey`] so the UI can display it (with a QR code) and block
+/// reboot until the user saves it. The root is LUKS2-encrypted, so this always
+/// runs; a failure leaves the system installed + encrypted but without a
+/// recovery key, which is a required-step failure.
+fn enroll_recovery_key(root_device: &str, tx: &Sender<Progress>) -> Result<(), String> {
+    let _ = tx.send(Progress::Step(
+        "Enrolling recovery key on the root".to_string(),
+    ));
+    let args = cryptenroll_recovery_args(root_device);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    log(tx, &format!("$ systemd-cryptenroll {}", arg_refs.join(" ")));
+    let output = Command::new("systemd-cryptenroll")
+        .args(&args)
+        .output()
+        .map_err(|err| format!("failed to run systemd-cryptenroll: {err}"))?;
+    // Do NOT forward stdout (the recovery key) OR stderr (the chrome includes a
+    // QR encoding of the key) to the progress log -- both would leak the key
+    // into ProgressState.log, outside the dedicated Recovery screen. The key is
+    // surfaced only via Progress::RecoveryKey. On failure, report the exit code
+    // only (no secret), since the QR is only printed on the success path anyway.
+    if !output.status.success() {
+        return Err(format!(
+            "systemd-cryptenroll exited {}; the root is encrypted but no recovery key was enrolled",
+            output
+                .status
+                .code()
+                .map_or_else(|| "by signal".to_string(), |c| c.to_string())
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let key = crate::recovery::parse_recovery_key(&stdout).ok_or_else(|| {
+        "systemd-cryptenroll succeeded but no recovery key could be parsed from its output"
+            .to_string()
+    })?;
+    let _ = tx.send(Progress::RecoveryKey(key));
     Ok(())
 }
 
@@ -266,6 +429,165 @@ fn cryptsetup_attach_args(root_device: &str) -> Vec<String> {
         "-".to_string(),
         "tpm2-device=auto,headless=yes".to_string(),
     ]
+}
+
+/// Build the `integritysetup format` argv for a keyed HMAC-SHA256 dm-integrity
+/// volume, per integritysetup(8): the HMAC integrity algorithm requires a key
+/// file and its size, plus a tag size (full SHA-256 digest). `--batch-mode`
+/// suppresses the interactive wipe confirmation.
+fn integritysetup_format_args(
+    device: &str,
+    key_path: &Path,
+    key_size: usize,
+    tag_size: usize,
+) -> Vec<String> {
+    vec![
+        "format".to_string(),
+        "--batch-mode".to_string(),
+        "--integrity".to_string(),
+        "hmac-sha256".to_string(),
+        "--integrity-key-file".to_string(),
+        key_path.display().to_string(),
+        "--integrity-key-size".to_string(),
+        key_size.to_string(),
+        "--tag-size".to_string(),
+        tag_size.to_string(),
+        device.to_string(),
+    ]
+}
+
+/// Build the `integritysetup open` argv. integritysetup(8): a non-default
+/// integrity algorithm is NOT detected from the device, so `--integrity` plus
+/// the same key file and size must be repeated. Maps the device to
+/// `/dev/mapper/<volume>`.
+fn integritysetup_open_args(
+    device: &str,
+    key_path: &Path,
+    key_size: usize,
+    volume: &str,
+) -> Vec<String> {
+    vec![
+        "open".to_string(),
+        "--integrity".to_string(),
+        "hmac-sha256".to_string(),
+        "--integrity-key-file".to_string(),
+        key_path.display().to_string(),
+        "--integrity-key-size".to_string(),
+        key_size.to_string(),
+        device.to_string(),
+        volume.to_string(),
+    ]
+}
+
+/// The `/etc/integritytab` line for the home volume. integritytab(5): with a key
+/// file present the algorithm defaults to hmac-sha256; the options select bitmap
+/// mode and discards. Newline-terminated. Fields are whitespace-delimited.
+fn integritytab_line() -> String {
+    format!("{HOME_VOLUME}\tPARTLABEL={HOME_PARTLABEL}\t{HOME_KEY_BOOT_PATH}\tallow-discards,mode=bitmap\n")
+}
+
+/// The `/etc/fstab` line that mounts the home integrity mapper at `/home`. The
+/// integritysetup-generator(8) sets up `/dev/mapper/home` from integritytab
+/// before `local-fs.target`, so a plain fstab line suffices; `x-systemd.requires`
+/// is added defensively to make the ordering dependency explicit. Newline-
+/// terminated.
+fn home_fstab_line() -> String {
+    format!(
+        "/dev/mapper/{HOME_VOLUME}\t/home\tbtrfs\tdefaults,x-systemd.requires=/dev/mapper/{HOME_VOLUME}\t0\t0\n"
+    )
+}
+
+/// Build the `systemd-cryptenroll --recovery-key` argv. The root already carries
+/// a TPM2 keyslot; `--unlock-tpm2-device=auto` (systemd-cryptenroll(1)) unlocks
+/// via the local TPM2 non-interactively so no passphrase prompt is needed.
+fn cryptenroll_recovery_args(root_device: &str) -> Vec<String> {
+    vec![
+        "--recovery-key".to_string(),
+        "--unlock-tpm2-device=auto".to_string(),
+        root_device.to_string(),
+    ]
+}
+
+/// The install-time path of the home integrity key under the mounted target,
+/// i.e. `<target>/etc/integritysetup-keys.d/home.key`. The boot-time path
+/// ([`HOME_KEY_BOOT_PATH`]) is the same file relative to the installed root.
+fn home_key_install_path(root_mount: &Path) -> PathBuf {
+    root_mount.join(HOME_KEY_BOOT_PATH.trim_start_matches('/'))
+}
+
+/// Generate a cryptographically secure integrity key by reading [`HOME_KEY_SIZE`]
+/// bytes from `/dev/urandom`. No `rand` dependency: `/dev/urandom` is the kernel
+/// CSPRNG and is always present on the installer image.
+fn generate_integrity_key() -> Result<Vec<u8>, String> {
+    let mut key = vec![0u8; HOME_KEY_SIZE];
+    let mut file = std::fs::File::open("/dev/urandom")
+        .map_err(|err| format!("could not open /dev/urandom: {err}"))?;
+    std::io::Read::read_exact(&mut file, &mut key)
+        .map_err(|err| format!("could not read random bytes: {err}"))?;
+    Ok(key)
+}
+
+/// Write the integrity key to `path` with mode 0600, creating its parent
+/// directory. Root-owned by virtue of the installer running as root.
+fn write_integrity_key(path: &Path, key: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
+
+    // Write to a fresh 0600 temp file, fsync it, then rename over the target and
+    // fsync the directory. create_new guarantees the secret never lands in a
+    // pre-existing file with wider permissions, and the fsyncs make the key
+    // durable BEFORE integritysetup formats home with it (a crash must not leave
+    // home formatted against a key that was only in page cache).
+    let tmp = path.with_extension("key.tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|err| format!("could not create {}: {err}", tmp.display()))?;
+    file.write_all(key)
+        .and_then(|()| file.sync_all())
+        .map_err(|err| format!("could not write {}: {err}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+        .map_err(|err| format!("could not install {}: {err}", path.display()))?;
+    // Best-effort directory fsync so the rename itself is durable.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Append a line to a file, creating it (and its parent directory) if absent.
+fn append_line(path: &Path, line: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
+    }
+    // If the file exists and does not end in a newline (a seeded /etc/fstab or
+    // /etc/integritytab might not), prepend one so the new record can't join the
+    // previous line and be mis-parsed at boot.
+    let needs_separator = match std::fs::read(path) {
+        Ok(bytes) => !bytes.is_empty() && bytes.last() != Some(&b'\n'),
+        Err(_) => false,
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|err| format!("could not open {}: {err}", path.display()))?;
+    let payload = if needs_separator {
+        format!("\n{line}")
+    } else {
+        line.to_string()
+    };
+    std::io::Write::write_all(&mut file, payload.as_bytes())
+        .map_err(|err| format!("could not append to {}: {err}", path.display()))
 }
 
 /// Ask udev to settle so the freshly written partition nodes appear.
@@ -452,6 +774,7 @@ struct TargetPartitions {
     esp: Option<String>,
     root: Option<String>,
     usr: Option<String>,
+    home: Option<String>,
 }
 
 /// Enumerate `device`'s partitions and classify them by GPT type. Returns an
@@ -505,6 +828,7 @@ fn classify(node: &LsblkNode, parts: &mut TargetPartitions) {
             "EFI System" => &mut parts.esp,
             k if k.starts_with("Linux root") => &mut parts.root,
             k if k.starts_with("Linux /usr") && !k.contains("verity") => &mut parts.usr,
+            "Linux home" => &mut parts.home,
             _ => return walk_children(node, parts),
         };
         if slot.is_none() {
@@ -531,7 +855,10 @@ mod tests {
 
     #[test]
     fn authorize_rejects_dry_run() {
-        assert!(InstallPlan::authorize(true, "/dev/sdb", "/dev/sdb", fb()).is_none());
+        assert!(InstallPlan::authorize(true, "/dev/sdb", "/dev/sdb", fb(), true).is_none());
+        // Dry-run is rejected regardless of the home flag, so the integrity and
+        // recovery steps are structurally unreachable in dry-run.
+        assert!(InstallPlan::authorize(true, "/dev/sdb", "/dev/sdb", fb(), false).is_none());
     }
 
     #[test]
@@ -551,23 +878,31 @@ mod tests {
 
     #[test]
     fn authorize_rejects_name_mismatch() {
-        assert!(InstallPlan::authorize(false, "/dev/sdb", "/dev/sda", fb()).is_none());
-        assert!(InstallPlan::authorize(false, "/dev/sdb", "", fb()).is_none());
-        assert!(InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb ", fb()).is_none());
-        assert!(InstallPlan::authorize(false, "/dev/sdb", "sdb", fb()).is_none());
+        assert!(InstallPlan::authorize(false, "/dev/sdb", "/dev/sda", fb(), true).is_none());
+        assert!(InstallPlan::authorize(false, "/dev/sdb", "", fb(), true).is_none());
+        assert!(InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb ", fb(), true).is_none());
+        assert!(InstallPlan::authorize(false, "/dev/sdb", "sdb", fb(), true).is_none());
     }
 
     #[test]
     fn authorize_rejects_empty_chosen_device() {
-        assert!(InstallPlan::authorize(false, "", "", fb()).is_none());
+        assert!(InstallPlan::authorize(false, "", "", fb(), true).is_none());
     }
 
     #[test]
     fn authorize_accepts_exact_match_when_not_dry_run() {
-        let plan =
-            InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb", fb()).expect("should authorize");
+        let plan = InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb", fb(), true)
+            .expect("should authorize");
         assert_eq!(plan.device, "/dev/sdb");
         assert_eq!(plan.definitions_dir, PathBuf::from(OUTPUT_DIR));
+        assert!(plan.home_requested);
+    }
+
+    #[test]
+    fn authorize_records_home_requested_flag() {
+        let plan = InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb", fb(), false)
+            .expect("should authorize");
+        assert!(!plan.home_requested);
     }
 
     #[test]
@@ -591,6 +926,26 @@ mod tests {
         assert_eq!(parts.root.as_deref(), Some("/dev/sdb4"));
         // The verity partition must not be picked as the /usr data partition.
         assert_eq!(parts.usr.as_deref(), Some("/dev/sdb2"));
+        // No home partition in this layout (home omitted by the user).
+        assert_eq!(parts.home, None);
+    }
+
+    #[test]
+    fn parse_partitions_classifies_home() {
+        let json = r#"{
+           "blockdevices": [
+              {
+                 "path": "/dev/sdb", "parttypename": null,
+                 "children": [
+                    {"path": "/dev/sdb1", "parttypename": "EFI System"},
+                    {"path": "/dev/sdb4", "parttypename": "Linux root (x86-64)"},
+                    {"path": "/dev/sdb6", "parttypename": "Linux home"}
+                 ]
+              }
+           ]
+        }"#;
+        let parts = parse_partitions(json).unwrap();
+        assert_eq!(parts.home.as_deref(), Some("/dev/sdb6"));
     }
 
     #[test]
@@ -619,6 +974,135 @@ mod tests {
         );
     }
 
+    #[test]
+    fn integritysetup_format_args_keyed_hmac_sha256() {
+        let args = integritysetup_format_args(
+            "/dev/sdb6",
+            Path::new("/run/k/home.key"),
+            HOME_KEY_SIZE,
+            HOME_TAG_SIZE,
+        );
+        assert_eq!(
+            args,
+            [
+                "format",
+                "--batch-mode",
+                "--integrity",
+                "hmac-sha256",
+                "--integrity-key-file",
+                "/run/k/home.key",
+                "--integrity-key-size",
+                "32",
+                "--tag-size",
+                "32",
+                "/dev/sdb6",
+            ]
+        );
+    }
+
+    #[test]
+    fn integritysetup_open_args_repeat_integrity_and_key() {
+        let args = integritysetup_open_args(
+            "/dev/sdb6",
+            Path::new("/run/k/home.key"),
+            HOME_KEY_SIZE,
+            HOME_VOLUME,
+        );
+        assert_eq!(
+            args,
+            [
+                "open",
+                "--integrity",
+                "hmac-sha256",
+                "--integrity-key-file",
+                "/run/k/home.key",
+                "--integrity-key-size",
+                "32",
+                "/dev/sdb6",
+                "home",
+            ]
+        );
+    }
+
+    #[test]
+    fn integritytab_line_matches_target_format() {
+        assert_eq!(
+            integritytab_line(),
+            "home\tPARTLABEL=HOME\t/etc/integritysetup-keys.d/home.key\tallow-discards,mode=bitmap\n"
+        );
+    }
+
+    #[test]
+    fn home_fstab_line_mounts_mapper_at_home() {
+        assert_eq!(
+            home_fstab_line(),
+            "/dev/mapper/home\t/home\tbtrfs\tdefaults,x-systemd.requires=/dev/mapper/home\t0\t0\n"
+        );
+    }
+
+    #[test]
+    fn cryptenroll_recovery_args_unlock_via_tpm2() {
+        assert_eq!(
+            cryptenroll_recovery_args("/dev/sdb4"),
+            ["--recovery-key", "--unlock-tpm2-device=auto", "/dev/sdb4",]
+        );
+    }
+
+    #[test]
+    fn home_key_install_path_joins_under_target() {
+        assert_eq!(
+            home_key_install_path(Path::new("/run/archetype-install/target")),
+            PathBuf::from("/run/archetype-install/target/etc/integritysetup-keys.d/home.key")
+        );
+    }
+
+    #[test]
+    fn generate_integrity_key_is_right_size_and_varies() {
+        let a = generate_integrity_key().expect("/dev/urandom should be readable");
+        let b = generate_integrity_key().expect("/dev/urandom should be readable");
+        assert_eq!(a.len(), HOME_KEY_SIZE);
+        assert_eq!(b.len(), HOME_KEY_SIZE);
+        assert_ne!(a, b, "two CSPRNG draws should differ");
+    }
+
+    #[test]
+    fn write_integrity_key_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("archetype-key-test-{}", std::process::id()));
+        let path = dir.join("etc/integritysetup-keys.d/home.key");
+        write_integrity_key(&path, &[0u8; HOME_KEY_SIZE]).expect("should write key");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_line_creates_and_appends() {
+        let dir =
+            std::env::temp_dir().join(format!("archetype-append-test-{}", std::process::id()));
+        let path = dir.join("etc/integritytab");
+        append_line(&path, "one\n").unwrap();
+        append_line(&path, "two\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_line_inserts_separator_when_file_lacks_trailing_newline() {
+        let dir =
+            std::env::temp_dir().join(format!("archetype-append-nl-test-{}", std::process::id()));
+        let path = dir.join("etc/fstab");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A seeded file with no trailing newline.
+        std::fs::write(&path, "existing line").unwrap();
+        append_line(&path, "new line\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "existing line\nnew line\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Destructive end-to-end smoke test. Requires root and a SCRATCH loop
     /// device or disk in ARCHETYPE_INSTALL_TEST_DEV; it WIPES that device.
     /// Ignored by default — run only in a throwaway VM:
@@ -628,7 +1112,7 @@ mod tests {
     fn execute_smoke_writes_to_scratch_device() {
         let device = std::env::var("ARCHETYPE_INSTALL_TEST_DEV")
             .expect("set ARCHETYPE_INSTALL_TEST_DEV to a SCRATCH device");
-        let plan = InstallPlan::authorize(false, &device, &device, fb())
+        let plan = InstallPlan::authorize(false, &device, &device, fb(), true)
             .expect("authorize should pass for an exact match");
         let install = spawn(plan);
         let mut outcome = None;

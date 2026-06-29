@@ -20,7 +20,7 @@ use crate::screens::progress::ProgressState;
 use crate::screens::review::ReviewState;
 use crate::screens::{
     confirm, disk_select, firstboot as firstboot_screen, preflight as preflight_screen, progress,
-    result, review, sizing, welcome,
+    recovery, result, review, sizing, welcome,
 };
 use crate::tui::Tui;
 
@@ -37,6 +37,7 @@ pub enum Screen {
     Review,
     Confirm,
     Progress,
+    Recovery,
     Result,
 }
 
@@ -166,6 +167,7 @@ impl App {
             Screen::Sizing => sizing::draw(frame, self),
             Screen::Review => review::draw(frame, self),
             Screen::Confirm => confirm::draw(frame, self),
+            Screen::Recovery => recovery::draw(frame, self),
             Screen::Result => result::draw(frame, self),
             Screen::Progress => progress::draw(frame, self),
         }
@@ -180,6 +182,7 @@ impl App {
             Screen::Sizing => sizing::handle_key(self, key),
             Screen::Review => review::handle_key(self, key),
             Screen::Confirm => confirm::handle_key(self, key),
+            Screen::Recovery => recovery::handle_key(self, key),
             Screen::Result => result::handle_key(self, key),
             Screen::Progress => progress::handle_key(),
         };
@@ -223,6 +226,8 @@ impl App {
                     Screen::Confirm
                 }
             }
+            // The recovery key has been acknowledged; reboot is now permitted.
+            Screen::Recovery => Screen::Result,
             other => other,
         };
     }
@@ -240,6 +245,7 @@ impl App {
             &device,
             &self.confirm_input,
             self.config.firstboot.clone(),
+            self.config.sizing.home.is_some(),
         ) {
             Some(plan) => {
                 self.progress = ProgressState::default();
@@ -264,6 +270,7 @@ impl App {
             match install.progress.try_recv() {
                 Ok(Progress::Step(step)) => self.progress.step = Some(step),
                 Ok(Progress::Line(line)) => self.progress.log.push(line),
+                Ok(Progress::RecoveryKey(key)) => self.progress.recovery_key = Some(key),
                 Ok(Progress::Done(outcome)) => {
                     self.progress.outcome = Some(outcome);
                     finished = true;
@@ -293,7 +300,17 @@ impl App {
             if let Some(mut install) = self.install.take() {
                 install.join();
             }
-            self.screen = Screen::Result;
+            // On a successful install with a recovery key, divert to the
+            // Recovery screen first; it blocks reboot until the user confirms
+            // they have saved the key, then advances to Result. Any other
+            // outcome (incomplete/failed, or no key) goes straight to Result.
+            self.screen = if matches!(self.progress.outcome, Some(Outcome::Success))
+                && self.progress.recovery_key.is_some()
+            {
+                Screen::Recovery
+            } else {
+                Screen::Result
+            };
         }
     }
 

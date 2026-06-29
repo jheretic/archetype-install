@@ -24,6 +24,9 @@ pub struct ProgressState {
     pub step: Option<String>,
     pub log: Vec<String>,
     pub outcome: Option<Outcome>,
+    /// The recovery key enrolled on the root, surfaced by the worker. Displayed
+    /// on the Recovery screen (with a QR code) before reboot is offered.
+    pub recovery_key: Option<String>,
 }
 
 /// Progress ignores input; it advances only when the worker finishes.

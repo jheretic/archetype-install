@@ -8,6 +8,7 @@ mod firstboot;
 mod install;
 mod layout;
 mod preflight;
+mod recovery;
 mod repart;
 mod screens;
 mod theme;

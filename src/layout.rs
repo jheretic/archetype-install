@@ -211,9 +211,21 @@ pub fn plan(sizing: &Sizing, disk_bytes: u64) -> Result<ConfigurablePartitions, 
                 choice,
             )
         }),
-        home: sizing
-            .home
-            .map(|choice| build(PartitionDef::new("home"), choice)),
+        // Format=empty + Label=HOME: the installer formats this partition into a
+        // keyed dm-integrity volume itself and records it in integritytab via
+        // PARTLABEL=HOME, so the partition must carry that GPT label (repart
+        // would otherwise default the label to "home", and the installed
+        // system's integritysetup-generator would never find PARTLABEL=HOME).
+        home: sizing.home.map(|choice| {
+            build(
+                PartitionDef {
+                    label: Some("HOME".to_string()),
+                    format: Some(Format::Empty),
+                    ..PartitionDef::new("home")
+                },
+                choice,
+            )
+        }),
     })
 }
 
@@ -265,6 +277,19 @@ mod tests {
         };
         let plan = plan(&sizing, DISK_512G).unwrap();
         assert!(plan.home.is_none());
+    }
+
+    #[test]
+    fn home_partition_is_labelled_and_empty_for_integrity() {
+        // The installer formats home into a dm-integrity volume and references
+        // it via PARTLABEL=HOME, so the generated partition MUST carry Label=HOME
+        // and Format=empty (repart would otherwise label it "home").
+        let plan = plan(&Sizing::default(), DISK_512G).unwrap();
+        let home = plan.home.as_ref().unwrap();
+        assert_eq!(home.label.as_deref(), Some("HOME"));
+        assert_eq!(home.format, Some(Format::Empty));
+        assert!(home.render().contains("Label=HOME"));
+        assert!(home.render().contains("Format=empty"));
     }
 
     #[test]

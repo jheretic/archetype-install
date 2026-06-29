@@ -15,11 +15,13 @@ pub enum Format {
     Btrfs,
     Swap,
     Squashfs,
+    Empty,
 }
 
 impl Format {
     fn as_str(self) -> &'static str {
         match self {
+            Format::Empty => "empty",
             Format::Vfat => "vfat",
             Format::Btrfs => "btrfs",
             Format::Swap => "swap",
@@ -79,6 +81,7 @@ impl Encrypt {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PartitionDef {
     pub type_: String,
+    pub label: Option<String>,
     pub size_min_bytes: Option<u64>,
     pub size_max_bytes: Option<u64>,
     pub format: Option<Format>,
@@ -104,6 +107,9 @@ impl PartitionDef {
     pub fn render(&self) -> String {
         let mut out = String::from("[Partition]\n");
         writeln!(out, "Type={}", self.type_).unwrap();
+        if let Some(label) = &self.label {
+            writeln!(out, "Label={label}").unwrap();
+        }
         if let Some(bytes) = self.size_min_bytes {
             writeln!(out, "SizeMinBytes={bytes}").unwrap();
         }

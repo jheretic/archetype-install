@@ -235,7 +235,12 @@ impl App {
             Some(disk) => disk.name.clone(),
             None => return false,
         };
-        match InstallPlan::authorize(self.dry_run, &device, &self.confirm_input) {
+        match InstallPlan::authorize(
+            self.dry_run,
+            &device,
+            &self.confirm_input,
+            self.config.firstboot.clone(),
+        ) {
             Some(plan) => {
                 self.progress = ProgressState::default();
                 self.install = Some(install::spawn(plan));

@@ -25,12 +25,20 @@ use std::thread::{self, JoinHandle};
 
 use serde::Deserialize;
 
+use crate::firstboot::FirstbootConfig;
 use crate::repart::generate::OUTPUT_DIR;
 use crate::repart::runner;
 
 /// Where the target root (and the cloned `/usr` beneath it) is mounted for the
 /// post-write steps. Under `/run`, cleared on reboot.
 const TARGET_MOUNT: &str = "/run/archetype-install/target";
+
+/// The device-mapper name for the unlocked target root. The opened LUKS2 volume
+/// appears at `/dev/mapper/<ROOT_VOLUME>`.
+const ROOT_VOLUME: &str = "archetype-root";
+
+/// `systemd-cryptsetup` is not on `PATH`; it ships at this fixed location.
+const CRYPTSETUP_BIN: &str = "/usr/lib/systemd/systemd-cryptsetup";
 
 /// A message from the install worker to the Progress screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,13 +71,19 @@ pub enum Outcome {
 pub struct InstallPlan {
     device: String,
     definitions_dir: PathBuf,
+    firstboot: FirstbootConfig,
 }
 
 impl InstallPlan {
     /// The sole constructor. Returns `Some` only when all safety invariants
     /// hold (see module docs). `chosen_device` is the DiskSelect target;
     /// `typed_name` is what the user typed on Confirm.
-    pub fn authorize(dry_run: bool, chosen_device: &str, typed_name: &str) -> Option<Self> {
+    pub fn authorize(
+        dry_run: bool,
+        chosen_device: &str,
+        typed_name: &str,
+        firstboot: FirstbootConfig,
+    ) -> Option<Self> {
         if dry_run {
             return None;
         }
@@ -82,6 +96,7 @@ impl InstallPlan {
         Some(Self {
             device: chosen_device.to_string(),
             definitions_dir: PathBuf::from(OUTPUT_DIR),
+            firstboot,
         })
     }
 }
@@ -166,9 +181,91 @@ fn post_steps(plan: &InstallPlan, tx: &Sender<Progress>) -> Result<(), String> {
         format!("target partitions could not be enumerated: {err}")
     })?;
 
+    // mount_and_seed opens the LUKS2 root (/dev/mapper/<ROOT_VOLUME>) and mounts
+    // it. From here on, any failure must tear that down so we don't leave an
+    // unlocked encrypted volume + mounts dangling on the recovery console.
     mount_and_seed(&parts, tx)?;
+    let root_mount = Path::new(TARGET_MOUNT);
+    let rest = apply_firstboot(&plan.firstboot, root_mount, tx)
+        .and_then(|()| write_machine_info(&plan.firstboot, root_mount, tx));
+    if let Err(detail) = rest {
+        detach_root(tx);
+        return Err(detail);
+    }
     bootloader_note(tx);
     Ok(())
+}
+
+/// Best-effort teardown of the opened+mounted target root after a post-open
+/// failure: unmount /usr and root, then detach the LUKS2 mapper so no unlocked
+/// encrypted volume is left dangling. Never fatal; logged only.
+fn detach_root(tx: &Sender<Progress>) {
+    let _ = tx.send(Progress::Step("Tearing down target root".to_string()));
+    let root_mount = Path::new(TARGET_MOUNT);
+    run_cmd(
+        tx,
+        "umount",
+        &[&root_mount.join("usr").display().to_string()],
+    );
+    run_cmd(tx, "umount", &[&root_mount.display().to_string()]);
+    run_cmd(tx, CRYPTSETUP_BIN, &["detach", ROOT_VOLUME]);
+}
+
+/// Apply first-boot config to the mounted target via
+/// `systemd-firstboot --root=<target>`. Required for a configured system; a
+/// failure leaves the disk written but unconfigured, hence
+/// [`Outcome::Incomplete`] (recoverable, no reboot).
+fn apply_firstboot(
+    firstboot: &FirstbootConfig,
+    root_mount: &Path,
+    tx: &Sender<Progress>,
+) -> Result<(), String> {
+    let _ = tx.send(Progress::Step("Applying first-boot config".to_string()));
+    let args = firstboot.firstboot_args(root_mount);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    if run_cmd(tx, "systemd-firstboot", &arg_refs) {
+        Ok(())
+    } else {
+        Err("systemd-firstboot failed to apply first-boot config to the target".to_string())
+    }
+}
+
+/// Write `<target>/etc/machine-info` with `CHASSIS=`. A discrete step: `CHASSIS=`
+/// is a machine-info(5) field, not a firstboot flag. `/etc` exists after the
+/// factory seed but the file itself usually does not, so it is created.
+fn write_machine_info(
+    firstboot: &FirstbootConfig,
+    root_mount: &Path,
+    tx: &Sender<Progress>,
+) -> Result<(), String> {
+    let _ = tx.send(Progress::Step("Writing /etc/machine-info".to_string()));
+    let path = root_mount.join("etc/machine-info");
+    log(tx, &format!("writing {}", path.display()));
+    std::fs::write(&path, firstboot.machine_info())
+        .map_err(|err| format!("could not write {}: {err}", path.display()))
+}
+
+/// TPM2-unlock the LUKS2 root via `systemd-cryptsetup attach`. The KEY-FILE
+/// positional is `-` (none) so the key is taken from the TPM2 keyslot in the
+/// LUKS2 header; `tpm2-device=auto` selects the local TPM2 and `headless=yes`
+/// forbids an interactive passphrase fallback. Opens at
+/// `/dev/mapper/<ROOT_VOLUME>`. Returns true on a clean attach.
+fn tpm2_unlock(tx: &Sender<Progress>, root_device: &str) -> bool {
+    let args = cryptsetup_attach_args(root_device);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_cmd(tx, CRYPTSETUP_BIN, &arg_refs)
+}
+
+/// Build the `systemd-cryptsetup attach` argv for the TPM2 root unlock. KEY-FILE
+/// is `-` (none); the crypttab options select the TPM2 keyslot non-interactively.
+fn cryptsetup_attach_args(root_device: &str) -> Vec<String> {
+    vec![
+        "attach".to_string(),
+        ROOT_VOLUME.to_string(),
+        root_device.to_string(),
+        "-".to_string(),
+        "tpm2-device=auto,headless=yes".to_string(),
+    ]
 }
 
 /// Ask udev to settle so the freshly written partition nodes appear.
@@ -191,24 +288,41 @@ fn mount_and_seed(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(),
         .as_ref()
         .ok_or_else(|| "no root partition found on the target".to_string())?;
     log(tx, &format!("root partition: {root}"));
-    warn(
-        tx,
-        "root is Encrypt=tpm2; unlocking via the TPM2-enrolled key is \
-         UNVERIFIED here. TODO: wire cryptsetup/systemd-cryptsetup unlock \
-         before mount. Attempting a plain mount (expected to fail on LUKS).",
-    );
-    if !try_mount(tx, root, root_mount) {
-        return Err(
-            "could not mount the target root (TPM2 unlock not yet wired); \
-             /usr mount + /etc seeding skipped"
-                .to_string(),
+
+    let _ = tx.send(Progress::Step("Unlocking target root (TPM2)".to_string()));
+    // A stale /dev/mapper/<ROOT_VOLUME> from an earlier aborted run would make
+    // the attach fail; clear it first (best effort, ignored if absent).
+    if Path::new(&format!("/dev/mapper/{ROOT_VOLUME}")).exists() {
+        warn(
+            tx,
+            &format!("stale /dev/mapper/{ROOT_VOLUME}; detaching first"),
         );
+        run_cmd(tx, CRYPTSETUP_BIN, &["detach", ROOT_VOLUME]);
+    }
+    if !tpm2_unlock(tx, root) {
+        return Err(format!(
+            "could not TPM2-unlock the target root {root}; the partitions are \
+             written but root could not be opened (recoverable, no reboot)"
+        ));
+    }
+    // Root is now OPEN. Any failure past this point must detach_root before
+    // returning so we don't leak an unlocked encrypted volume.
+    let opened = format!("/dev/mapper/{ROOT_VOLUME}");
+    if !try_mount(tx, &opened, root_mount) {
+        detach_root(tx);
+        return Err(format!(
+            "unlocked root {opened} but could not mount it at {TARGET_MOUNT} \
+             (recoverable, no reboot)"
+        ));
     }
 
-    let usr = parts
-        .usr
-        .as_ref()
-        .ok_or_else(|| "no /usr partition found on the target".to_string())?;
+    let usr = match parts.usr.as_ref() {
+        Some(usr) => usr,
+        None => {
+            detach_root(tx);
+            return Err("no /usr partition found on the target".to_string());
+        }
+    };
     let _ = tx.send(Progress::Step("Mounting cloned /usr".to_string()));
     log(tx, &format!("/usr partition: {usr}"));
     warn(
@@ -217,13 +331,16 @@ fn mount_and_seed(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(),
          systemd-dissect). UNVERIFIED. TODO: open the verity volume before mount.",
     );
     let usr_mount = root_mount.join("usr");
-    std::fs::create_dir_all(&usr_mount)
-        .map_err(|err| format!("could not create {}: {err}", usr_mount.display()))?;
+    if let Err(err) = std::fs::create_dir_all(&usr_mount) {
+        detach_root(tx);
+        return Err(format!("could not create {}: {err}", usr_mount.display()));
+    }
     if !try_mount(tx, usr, &usr_mount) {
+        detach_root(tx);
         return Err("could not mount the cloned /usr; /etc seeding skipped".to_string());
     }
 
-    seed_etc(tx, root_mount)
+    seed_etc(tx, root_mount).inspect_err(|_| detach_root(tx))
 }
 
 /// `systemd-tmpfiles --root=<target> --boot --create`: seed persistent `/etc`
@@ -270,11 +387,26 @@ fn try_mount(tx: &Sender<Progress>, source: &str, target: &Path) -> bool {
     run_cmd(tx, "mount", &[source, &target.display().to_string()])
 }
 
+/// Redact secret-bearing argv flags before they are logged to the progress TUI.
+/// The root password hash must never appear in the on-screen log.
+fn redact_arg(arg: &str) -> String {
+    const SECRET_FLAGS: [&str; 2] = ["--root-password-hashed=", "--root-password="];
+    for flag in SECRET_FLAGS {
+        if let Some(rest) = arg.strip_prefix(flag) {
+            if !rest.is_empty() {
+                return format!("{flag}<redacted>");
+            }
+        }
+    }
+    arg.to_string()
+}
+
 /// Run a command, logging the invocation and its captured output. Returns true
 /// on a zero exit. A spawn failure or non-zero exit is logged as a warning but
 /// is never fatal (post-steps are best-effort; see [`post_steps`]).
 fn run_cmd(tx: &Sender<Progress>, program: &str, args: &[&str]) -> bool {
-    log(tx, &format!("$ {program} {}", args.join(" ")));
+    let shown: Vec<String> = args.iter().map(|a| redact_arg(a)).collect();
+    log(tx, &format!("$ {program} {}", shown.join(" ")));
     match Command::new(program).args(args).output() {
         Ok(output) => {
             for stream in [&output.stdout, &output.stderr] {
@@ -391,28 +523,49 @@ fn walk_children(node: &LsblkNode, parts: &mut TargetPartitions) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::firstboot::FirstbootConfig;
+
+    fn fb() -> FirstbootConfig {
+        FirstbootConfig::default()
+    }
 
     #[test]
     fn authorize_rejects_dry_run() {
-        assert!(InstallPlan::authorize(true, "/dev/sdb", "/dev/sdb").is_none());
+        assert!(InstallPlan::authorize(true, "/dev/sdb", "/dev/sdb", fb()).is_none());
+    }
+
+    #[test]
+    fn redact_arg_hides_the_password_hash_only() {
+        assert_eq!(
+            redact_arg("--root-password-hashed=$6$salt$hash"),
+            "--root-password-hashed=<redacted>"
+        );
+        assert_eq!(redact_arg("--hostname=archetype"), "--hostname=archetype");
+        assert_eq!(redact_arg("--setup-machine-id"), "--setup-machine-id");
+        // An empty value is not a secret to hide (and shouldn't be emitted anyway).
+        assert_eq!(
+            redact_arg("--root-password-hashed="),
+            "--root-password-hashed="
+        );
     }
 
     #[test]
     fn authorize_rejects_name_mismatch() {
-        assert!(InstallPlan::authorize(false, "/dev/sdb", "/dev/sda").is_none());
-        assert!(InstallPlan::authorize(false, "/dev/sdb", "").is_none());
-        assert!(InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb ").is_none());
-        assert!(InstallPlan::authorize(false, "/dev/sdb", "sdb").is_none());
+        assert!(InstallPlan::authorize(false, "/dev/sdb", "/dev/sda", fb()).is_none());
+        assert!(InstallPlan::authorize(false, "/dev/sdb", "", fb()).is_none());
+        assert!(InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb ", fb()).is_none());
+        assert!(InstallPlan::authorize(false, "/dev/sdb", "sdb", fb()).is_none());
     }
 
     #[test]
     fn authorize_rejects_empty_chosen_device() {
-        assert!(InstallPlan::authorize(false, "", "").is_none());
+        assert!(InstallPlan::authorize(false, "", "", fb()).is_none());
     }
 
     #[test]
     fn authorize_accepts_exact_match_when_not_dry_run() {
-        let plan = InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb").expect("should authorize");
+        let plan =
+            InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb", fb()).expect("should authorize");
         assert_eq!(plan.device, "/dev/sdb");
         assert_eq!(plan.definitions_dir, PathBuf::from(OUTPUT_DIR));
     }
@@ -452,6 +605,20 @@ mod tests {
         assert!(parse_partitions("not json").is_err());
     }
 
+    #[test]
+    fn cryptsetup_attach_args_unlock_root_via_tpm2() {
+        assert_eq!(
+            cryptsetup_attach_args("/dev/sdb4"),
+            [
+                "attach",
+                ROOT_VOLUME,
+                "/dev/sdb4",
+                "-",
+                "tpm2-device=auto,headless=yes",
+            ]
+        );
+    }
+
     /// Destructive end-to-end smoke test. Requires root and a SCRATCH loop
     /// device or disk in ARCHETYPE_INSTALL_TEST_DEV; it WIPES that device.
     /// Ignored by default — run only in a throwaway VM:
@@ -461,7 +628,7 @@ mod tests {
     fn execute_smoke_writes_to_scratch_device() {
         let device = std::env::var("ARCHETYPE_INSTALL_TEST_DEV")
             .expect("set ARCHETYPE_INSTALL_TEST_DEV to a SCRATCH device");
-        let plan = InstallPlan::authorize(false, &device, &device)
+        let plan = InstallPlan::authorize(false, &device, &device, fb())
             .expect("authorize should pass for an exact match");
         let install = spawn(plan);
         let mut outcome = None;

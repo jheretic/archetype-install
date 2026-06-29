@@ -10,6 +10,8 @@
 //! `systemd-firstboot --root-password-hashed=` expects. No hashing tool is
 //! installed in the image, so we hash in-process.
 
+use std::path::Path;
+
 use anyhow::{anyhow, Result};
 use sha_crypt::{sha512_simple, Sha512Params, ROUNDS_DEFAULT};
 
@@ -51,6 +53,7 @@ impl Chassis {
 /// First-boot fields accumulated on the Config screen. The text fields start at
 /// sensible defaults; `root_password_hash` is `None` until the password is
 /// entered, confirmed, and hashed.
+#[derive(Clone)]
 pub struct FirstbootConfig {
     pub keymap: String,
     pub locale: String,
@@ -75,6 +78,44 @@ impl Default for FirstbootConfig {
 }
 
 impl FirstbootConfig {
+    /// Build the `systemd-firstboot --root=<root>` argument vector for an
+    /// offline target tree. Empty text fields and a `None` password hash are
+    /// omitted (firstboot leaves an unconfigured setting unprompted under
+    /// `--root`). `--setup-machine-id` is always passed so the installed system
+    /// gets a fresh machine-id rather than inheriting the installer's. `--force`
+    /// is required: the target /etc was just seeded from the factory tree
+    /// (/usr/share/factory/etc ships locale.conf, vconsole.conf, passwd, shadow,
+    /// ...), and without --force firstboot silently skips any file that already
+    /// exists -- which would drop the wizard's root password and lock the
+    /// operator out while still reporting success.
+    pub fn firstboot_args(&self, root: &Path) -> Vec<String> {
+        let mut args = vec![format!("--root={}", root.display()), "--force".to_string()];
+        let mut push = |flag: &str, value: &str| {
+            if !value.trim().is_empty() {
+                args.push(format!("{flag}={value}"));
+            }
+        };
+        push("--locale", &self.locale);
+        push("--locale-messages", &self.locale);
+        push("--keymap", &self.keymap);
+        push("--timezone", &self.timezone);
+        push("--hostname", &self.hostname);
+        if let Some(hash) = self.root_password_hash.as_deref() {
+            if !hash.is_empty() {
+                args.push(format!("--root-password-hashed={hash}"));
+            }
+        }
+        args.push("--setup-machine-id".to_string());
+        args
+    }
+
+    /// The `/etc/machine-info` contents carrying `CHASSIS=`. Newline-terminated.
+    /// `CHASSIS=` is a machine-info(5) field, not a firstboot flag, so it is
+    /// written as a discrete step.
+    pub fn machine_info(&self) -> String {
+        format!("CHASSIS={}\n", self.chassis.as_str())
+    }
+
     /// Whether every required text field is filled and the hostname is valid.
     /// Independent of the password, which the screen gates separately.
     pub fn fields_complete(&self) -> bool {
@@ -157,6 +198,68 @@ mod tests {
         assert!(config.fields_complete());
         config.keymap.clear();
         assert!(!config.fields_complete());
+    }
+
+    #[test]
+    fn firstboot_args_render_all_set_fields() {
+        let config = FirstbootConfig {
+            keymap: "us".to_string(),
+            locale: "en_US.UTF-8".to_string(),
+            timezone: "UTC".to_string(),
+            hostname: "archetype".to_string(),
+            chassis: Chassis::Desktop,
+            root_password_hash: Some("$6$salt$hash".to_string()),
+        };
+        let args = config.firstboot_args(Path::new("/run/archetype-install/target"));
+        assert_eq!(
+            args,
+            [
+                "--root=/run/archetype-install/target",
+                "--force",
+                "--locale=en_US.UTF-8",
+                "--locale-messages=en_US.UTF-8",
+                "--keymap=us",
+                "--timezone=UTC",
+                "--hostname=archetype",
+                "--root-password-hashed=$6$salt$hash",
+                "--setup-machine-id",
+            ]
+        );
+    }
+
+    #[test]
+    fn firstboot_args_omit_empty_and_none_fields() {
+        let config = FirstbootConfig {
+            keymap: "  ".to_string(),
+            locale: String::new(),
+            timezone: "UTC".to_string(),
+            hostname: String::new(),
+            chassis: Chassis::Server,
+            root_password_hash: None,
+        };
+        let args = config.firstboot_args(Path::new("/mnt"));
+        assert_eq!(
+            args,
+            [
+                "--root=/mnt",
+                "--force",
+                "--timezone=UTC",
+                "--setup-machine-id"
+            ]
+        );
+        assert!(!args.iter().any(|a| a.starts_with("--root-password-hashed")));
+        assert!(!args.iter().any(|a| a.starts_with("--keymap")));
+        assert!(!args.iter().any(|a| a.starts_with("--locale")));
+        assert!(!args.iter().any(|a| a.starts_with("--hostname")));
+    }
+
+    #[test]
+    fn machine_info_carries_chassis_newline_terminated() {
+        let config = FirstbootConfig {
+            chassis: Chassis::Laptop,
+            ..FirstbootConfig::default()
+        };
+        assert_eq!(config.machine_info(), "CHASSIS=laptop\n");
     }
 
     #[test]

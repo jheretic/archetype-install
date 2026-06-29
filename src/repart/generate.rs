@@ -149,27 +149,27 @@ mod tests {
             ),
             (
                 "10-usr.conf",
-                "[Partition]\nType=usr\nSizeMinBytes=512M\nSizeMaxBytes=512M\nVerity=data\nVerityMatchKey=usr\n# Clone the running system's verity /usr block-for-block (self-install), NOT\n# Format= an empty squashfs. CopyBlocks and Format are mutually exclusive.\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr\nLabel=%M_%A\nSizeMinBytes=512M\nSizeMaxBytes=512M\nVerity=data\nVerityMatchKey=usr\n# Clone the running system's verity /usr block-for-block (self-install), NOT\n# Format= an empty squashfs. CopyBlocks and Format are mutually exclusive.\nCopyBlocks=auto\n",
             ),
             (
                 "20-usr-verity.conf",
-                "[Partition]\nType=usr-verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr\n# Clone the running verity hash partition block-for-block. repart will not\n# recompute the hash tree during a self-install; the live hash must be copied.\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr-verity\nLabel=%M_%A_verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr\n# Clone the running verity hash partition block-for-block. repart will not\n# recompute the hash tree during a self-install; the live hash must be copied.\nCopyBlocks=auto\n",
             ),
             (
                 "30-usr-verity-sig.conf",
-                "[Partition]\nType=usr-verity-sig\nVerity=signature\nVerityMatchKey=usr\n# Clone the running signature partition (no signing key needed in the live\n# installer; spike confirmed CopyBlocks=auto resolves it).\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr-verity-sig\nLabel=%M_%A_verity_sig\nVerity=signature\nVerityMatchKey=usr\n# Clone the running signature partition (no signing key needed in the live\n# installer; spike confirmed CopyBlocks=auto resolves it).\nCopyBlocks=auto\n",
             ),
             (
                 "40-usr-b.conf",
-                "[Partition]\nType=usr\nSizeMinBytes=512M\nSizeMaxBytes=512M\nVerity=data\nVerityMatchKey=usr-b\n# Mirror of the A slot (10-usr): clone the running /usr block-for-block so the\n# installed system can boot from either slot immediately. The A/B updater\n# overwrites this on the first image update.\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr\nLabel=%M_%A\nSizeMinBytes=512M\nSizeMaxBytes=512M\nVerity=data\nVerityMatchKey=usr-b\n# Mirror of the A slot (10-usr): clone the running /usr block-for-block so the\n# installed system can boot from either slot immediately. The A/B updater\n# overwrites this on the first image update.\nCopyBlocks=auto\n",
             ),
             (
                 "50-usr-verity-b.conf",
-                "[Partition]\nType=usr-verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr-b\n# Mirror of the A slot (20-usr-verity): clone the running verity hash partition\n# block-for-block. The A/B updater replaces it on the first image update.\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr-verity\nLabel=%M_%A_verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr-b\n# Mirror of the A slot (20-usr-verity): clone the running verity hash partition\n# block-for-block. The A/B updater replaces it on the first image update.\nCopyBlocks=auto\n",
             ),
             (
                 "60-usr-verity-sig-b.conf",
-                "[Partition]\nType=usr-verity-sig\nVerity=signature\nVerityMatchKey=usr-b\n# Mirror of the A slot (30-usr-verity-sig): clone the running signature\n# partition. The A/B updater replaces it on the first image update.\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr-verity-sig\nLabel=%M_%A_verity_sig\nVerity=signature\nVerityMatchKey=usr-b\n# Mirror of the A slot (30-usr-verity-sig): clone the running signature\n# partition. The A/B updater replaces it on the first image update.\nCopyBlocks=auto\n",
             ),
         ])
     }

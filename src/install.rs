@@ -276,6 +276,7 @@ fn post_steps(plan: &InstallPlan, tx: &Sender<Progress>) -> Result<(), String> {
     let rest = apply_firstboot(&plan.firstboot, root_mount, tx)
         .and_then(|()| write_machine_info(&plan.firstboot, root_mount, tx))
         .and_then(|()| integrity_home(plan, &parts, root_mount, tx))
+        .and_then(|()| populate_esp(&parts, tx))
         .and_then(|()| {
             let root = parts
                 .root
@@ -287,7 +288,6 @@ fn post_steps(plan: &InstallPlan, tx: &Sender<Progress>) -> Result<(), String> {
         detach_root(tx);
         return Err(detail);
     }
-    bootloader_note(tx);
     Ok(())
 }
 
@@ -756,22 +756,79 @@ fn interpret_tmpfiles_exit(code: Option<i32>) -> Result<(), String> {
     }
 }
 
-/// The bootloader step. Per the Phase-1 spike (PLAN \u{a7}13 Q4), the runtime ESP
-/// template's `CopyFiles` populates the loader + UKIs and excludes
-/// `installer.addon.efi`, so repart itself handles the ESP during the write.
-/// Whether `bootctl install --root` / `kernel-install` is additionally needed
-/// is not confirmed in-image; flag it rather than guess.
-fn bootloader_note(tx: &Sender<Progress>) {
-    let _ = tx.send(Progress::Step("Bootloader".to_string()));
-    log(
+/// Where the target ESP is mounted while we populate it. Under /run.
+const TARGET_ESP_MOUNT: &str = "/run/archetype-install/esp";
+/// The live system's mounted ESP (systemd-gpt-auto mounts it here).
+const LIVE_ESP: &str = "/efi";
+
+/// Populate the target ESP so the installed system is bootable.
+///
+/// The installer's repart ESP template (repart.sysinstall.d/00-efi.conf) creates
+/// an EMPTY vfat ESP -- unlike the live image's build-time ESP, it has no
+/// CopyFiles. So nothing put the bootloader/UKI on the target, and the firmware
+/// found no boot device (the spike's PLAN section 13 Q4, now resolved: yes, the
+/// installer must populate the ESP). Copy the live ESP's contents
+/// (systemd-boot under EFI/, loader/, the UKI under EFI/Linux/) to the target,
+/// EXCLUDING installer.addon.efi -- that addon forces systemd.unit=
+/// system-install.target, so an installed system carrying it would boot back
+/// into the installer. Then bootctl install lays down the EFI/BOOT/BOOTX64.EFI
+/// removable fallback + a boot entry. Required step: a failure here means an
+/// unbootable install, so it returns Err (-> Outcome::Incomplete).
+fn populate_esp(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(), String> {
+    let _ = tx.send(Progress::Step(
+        "Populating ESP (bootloader + UKI)".to_string(),
+    ));
+    let esp = parts
+        .esp
+        .as_ref()
+        .ok_or_else(|| "no ESP partition found on the target".to_string())?;
+
+    let mnt = Path::new(TARGET_ESP_MOUNT);
+    std::fs::create_dir_all(mnt)
+        .map_err(|e| format!("could not create {TARGET_ESP_MOUNT}: {e}"))?;
+    if !try_mount(tx, esp, mnt) {
+        return Err(format!("could not mount the target ESP {esp}"));
+    }
+
+    // Copy the live ESP -> target ESP. cp -a --no-target-directory lands the
+    // live ESP's CONTENTS (EFI/, loader/) at the target root (verified), then we
+    // delete the installer addon (cp has no --exclude) so the installed system
+    // doesn't re-enter the installer.
+    let dst = mnt.display().to_string();
+    let copied = run_cmd(tx, "cp", &["-a", "--no-target-directory", LIVE_ESP, &dst]);
+    // Remove the addon if it rode along (cp has no --exclude; delete after).
+    let addon = mnt.join("loader/addons/installer.addon.efi");
+    if addon.exists() {
+        let _ = std::fs::remove_file(&addon);
+        log(tx, "removed installer.addon.efi from target ESP");
+    }
+    if !copied {
+        let _ = umount(tx, mnt);
+        return Err("failed to copy the bootloader/UKI to the target ESP".to_string());
+    }
+
+    // bootctl install: write the removable fallback EFI/BOOT/BOOTX64.EFI + a
+    // systemd-boot entry into the target ESP. --no-variables: don't touch the
+    // live firmware's NVRAM boot order (the target boots via the fallback path).
+    if !run_cmd(
         tx,
-        "ESP populated by repart CopyFiles (installer.addon.efi excluded, per spike).",
-    );
-    warn(
-        tx,
-        "TODO/UNVERIFIED: confirm on a live VM whether bootctl install --root / \
-         kernel-install is also required, or repart's ESP CopyFiles suffices.",
-    );
+        "bootctl",
+        &["install", "--esp-path", &dst, "--no-variables"],
+    ) {
+        warn(
+            tx,
+            "bootctl install reported an error; the copied EFI/ tree may still \
+             boot via the removable fallback, but verify on the target.",
+        );
+    }
+
+    let _ = umount(tx, mnt);
+    Ok(())
+}
+
+/// `umount <path>`, logged. Returns true on success.
+fn umount(tx: &Sender<Progress>, path: &Path) -> bool {
+    run_cmd(tx, "umount", &[&path.display().to_string()])
 }
 
 /// Attempt `mount <source> <target>`, logging the result. Returns true on a

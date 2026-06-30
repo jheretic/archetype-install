@@ -823,8 +823,27 @@ fn interpret_tmpfiles_exit(code: Option<i32>) -> Result<(), String> {
 
 /// Where the target ESP is mounted while we populate it. Under /run.
 const TARGET_ESP_MOUNT: &str = "/run/archetype-install/esp";
-/// The live system's mounted ESP (systemd-gpt-auto mounts it here).
-const LIVE_ESP: &str = "/efi";
+
+/// Discover where the LIVE system's ESP is mounted. systemd doesn't fix this to
+/// one path: `bootctl --print-esp-path` reports the real mount, and the
+/// conventional locations are /efi, /boot, /boot/efi (bootctl's own search
+/// order). Prefer bootctl; fall back to the first of those that has an EFI/ dir.
+fn find_live_esp() -> Option<String> {
+    if let Ok(out) = Command::new("bootctl").arg("--print-esp-path").output() {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() && Path::new(&p).join("EFI").is_dir() {
+                return Some(p);
+            }
+        }
+    }
+    for cand in ["/efi", "/boot", "/boot/efi"] {
+        if Path::new(cand).join("EFI").is_dir() {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
 
 /// Populate the target ESP so the installed system is bootable.
 ///
@@ -848,6 +867,10 @@ fn populate_esp(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(), S
         .as_ref()
         .ok_or_else(|| "no ESP partition found on the target".to_string())?;
 
+    let live_esp = find_live_esp()
+        .ok_or_else(|| "could not locate the live ESP (bootctl/efi/boot)".to_string())?;
+    log(tx, &format!("live ESP: {live_esp}"));
+
     let mnt = Path::new(TARGET_ESP_MOUNT);
     std::fs::create_dir_all(mnt)
         .map_err(|e| format!("could not create {TARGET_ESP_MOUNT}: {e}"))?;
@@ -860,7 +883,7 @@ fn populate_esp(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(), S
     // delete the installer addon (cp has no --exclude) so the installed system
     // doesn't re-enter the installer.
     let dst = mnt.display().to_string();
-    let copied = run_cmd(tx, "cp", &["-a", "--no-target-directory", LIVE_ESP, &dst]);
+    let copied = run_cmd(tx, "cp", &["-a", "--no-target-directory", &live_esp, &dst]);
     // Remove the addon if it rode along (cp has no --exclude; delete after).
     let addon = mnt.join("loader/addons/installer.addon.efi");
     if addon.exists() {

@@ -152,11 +152,66 @@ impl Install {
 /// carries the progress channel; the worker runs to a terminal
 /// [`Progress::Done`] on its own thread.
 pub fn spawn(plan: InstallPlan) -> Install {
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || run(plan, tx));
+    // The worker sends Progress over `work_tx`. A forwarder thread tees every
+    // message to a persistent log (so the record survives the TUI teardown and
+    // can be read on a failed/incomplete install) AND to stderr (captured by
+    // the journal when run via archetype-install.service), then forwards to the
+    // UI receiver. This keeps the 17 worker fns unchanged -- they still just
+    // send Progress -- while making the install fully debuggable.
+    let (work_tx, work_rx) = mpsc::channel::<Progress>();
+    let (ui_tx, ui_rx) = mpsc::channel::<Progress>();
+
+    thread::spawn(move || tee_progress(work_rx, ui_tx));
+    let handle = thread::spawn(move || run(plan, work_tx));
+
     Install {
-        progress: rx,
+        progress: ui_rx,
         handle: Some(handle),
+    }
+}
+
+/// Path of the persistent install log (under /run, cleared on reboot but
+/// readable for the lifetime of a live session -- the whole point on a
+/// passwordless live image where the TUI output would otherwise vanish).
+const LOG_PATH: &str = "/run/archetype-install/install.log";
+
+/// Forward every Progress message from the worker to the UI, teeing each to the
+/// install log file and stderr first. Best-effort: a logging failure never
+/// blocks the install or the UI.
+fn tee_progress(work_rx: Receiver<Progress>, ui_tx: Sender<Progress>) {
+    use std::io::Write;
+    let mut logfile = std::fs::create_dir_all("/run/archetype-install")
+        .ok()
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(LOG_PATH)
+                .ok()
+        });
+    while let Ok(msg) = work_rx.recv() {
+        if let Some(line) = render_log_line(&msg) {
+            // stderr -> journal when run as a service.
+            eprintln!("{line}");
+            if let Some(f) = logfile.as_mut() {
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
+            }
+        }
+        // Forward to the UI; if the UI is gone, keep draining so the worker
+        // doesn't block on a full channel, but logging above still records it.
+        let _ = ui_tx.send(msg);
+    }
+}
+
+/// One log line for a Progress message, or None for messages with no useful
+/// textual form. Recovery keys are NEVER logged (secret).
+fn render_log_line(msg: &Progress) -> Option<String> {
+    match msg {
+        Progress::Step(s) => Some(format!("==> {s}")),
+        Progress::Line(l) => Some(l.clone()),
+        Progress::RecoveryKey(_) => None,
+        Progress::Done(outcome) => Some(format!("DONE: {outcome:?}")),
     }
 }
 

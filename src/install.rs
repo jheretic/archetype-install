@@ -37,6 +37,9 @@ const TARGET_MOUNT: &str = "/run/archetype-install/target";
 /// appears at `/dev/mapper/<ROOT_VOLUME>`.
 const ROOT_VOLUME: &str = "archetype-root";
 
+/// device-mapper name for the verity-opened /usr; appears at /dev/mapper/<this>.
+const USR_VERITY_VOLUME: &str = "archetype-usr";
+
 /// `systemd-cryptsetup` is not on `PATH`; it ships at this fixed location.
 const CRYPTSETUP_BIN: &str = "/usr/lib/systemd/systemd-cryptsetup";
 
@@ -420,11 +423,13 @@ fn enroll_recovery_key(root_device: &str, tx: &Sender<Progress>) -> Result<(), S
 fn detach_root(tx: &Sender<Progress>) {
     let _ = tx.send(Progress::Step("Tearing down target root".to_string()));
     let root_mount = Path::new(TARGET_MOUNT);
+    // Order: unmount /usr, close its verity mapper, unmount root, detach LUKS.
     run_cmd(
         tx,
         "umount",
         &[&root_mount.join("usr").display().to_string()],
     );
+    run_cmd(tx, "veritysetup", &["close", USR_VERITY_VOLUME]);
     run_cmd(tx, "umount", &[&root_mount.display().to_string()]);
     run_cmd(tx, CRYPTSETUP_BIN, &["detach", ROOT_VOLUME]);
 }
@@ -700,24 +705,84 @@ fn mount_and_seed(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(),
             return Err("no /usr partition found on the target".to_string());
         }
     };
-    let _ = tx.send(Progress::Step("Mounting cloned /usr".to_string()));
-    log(tx, &format!("/usr partition: {usr}"));
-    warn(
+    let _ = tx.send(Progress::Step(
+        "Opening cloned /usr (dm-verity)".to_string(),
+    ));
+    log(tx, &format!("/usr data partition: {usr}"));
+
+    // Open /usr through dm-verity (integrity-checked) rather than bare-mounting
+    // the data partition. veritysetup open <data> <name> <hash> <roothash>
+    // verifies every block against the Merkle tree rooted at <roothash>. The
+    // cloned /usr is a block-for-block CopyBlocks=auto of the RUNNING /usr, so
+    // its root hash is the live system's usrhash= (on /proc/cmdline) and its
+    // hash tree is the cloned usr-verity partition.
+    let hash_dev = match parts.usr_verity.as_ref() {
+        Some(h) => h,
+        None => {
+            detach_root(tx);
+            return Err("no /usr verity (hash) partition found on the target".to_string());
+        }
+    };
+    let roothash = match read_usrhash() {
+        Some(h) => h,
+        None => {
+            detach_root(tx);
+            return Err(
+                "could not read usrhash= from /proc/cmdline; cannot verity-open /usr".to_string(),
+            );
+        }
+    };
+    log(tx, &format!("/usr verity hash partition: {hash_dev}"));
+    // Clear a stale mapper from an earlier aborted run (would block open).
+    if Path::new(&format!("/dev/mapper/{USR_VERITY_VOLUME}")).exists() {
+        warn(
+            tx,
+            &format!("stale /dev/mapper/{USR_VERITY_VOLUME}; closing first"),
+        );
+        run_cmd(tx, "veritysetup", &["close", USR_VERITY_VOLUME]);
+    }
+    if !run_cmd(
         tx,
-        "/usr is dm-verity; a bare mount needs the hash+sig (veritysetup / \
-         systemd-dissect). UNVERIFIED. TODO: open the verity volume before mount.",
-    );
+        "veritysetup",
+        &["open", usr, USR_VERITY_VOLUME, hash_dev, &roothash],
+    ) {
+        detach_root(tx);
+        return Err(format!(
+            "veritysetup open failed for /usr ({usr}); the root hash may not \
+             match the cloned hash partition (recoverable, no reboot)"
+        ));
+    }
+    // /usr verity is now OPEN; teardown must close it (detach_root does).
+    let usr_mapper = format!("/dev/mapper/{USR_VERITY_VOLUME}");
     let usr_mount = root_mount.join("usr");
     if let Err(err) = std::fs::create_dir_all(&usr_mount) {
         detach_root(tx);
         return Err(format!("could not create {}: {err}", usr_mount.display()));
     }
-    if !try_mount(tx, usr, &usr_mount) {
+    if !try_mount(tx, &usr_mapper, &usr_mount) {
         detach_root(tx);
-        return Err("could not mount the cloned /usr; /etc seeding skipped".to_string());
+        return Err(format!(
+            "verity-opened /usr {usr_mapper} but could not mount it; /etc seeding skipped"
+        ));
     }
 
     seed_etc(tx, root_mount).inspect_err(|_| detach_root(tx))
+}
+
+/// The running system's `usrhash=` (verity root hash for /usr) from
+/// `/proc/cmdline`. The cloned /usr shares it (block-for-block clone of the
+/// running /usr). Returns the hex string, or None if absent/unreadable.
+fn read_usrhash() -> Option<String> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+    parse_usrhash(&cmdline)
+}
+
+/// Extract `usrhash=<hex>` from a kernel cmdline string. Pure, for testing.
+fn parse_usrhash(cmdline: &str) -> Option<String> {
+    cmdline
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("usrhash=").map(str::to_string))
+        .filter(|h| !h.is_empty())
 }
 
 /// `systemd-tmpfiles --root=<target> --boot --create`: seed persistent `/etc`
@@ -908,6 +973,7 @@ struct TargetPartitions {
     esp: Option<String>,
     root: Option<String>,
     usr: Option<String>,
+    usr_verity: Option<String>,
     home: Option<String>,
 }
 
@@ -961,6 +1027,14 @@ fn classify(node: &LsblkNode, parts: &mut TargetPartitions) {
         let slot = match kind {
             "EFI System" => &mut parts.esp,
             k if k.starts_with("Linux root") => &mut parts.root,
+            // Verity hash partition first (more specific) so the data arm's
+            // !verity guard isn't needed to disambiguate, but keep both clear.
+            k if k.starts_with("Linux /usr")
+                && k.contains("verity")
+                && !k.contains("signature") =>
+            {
+                &mut parts.usr_verity
+            }
             k if k.starts_with("Linux /usr") && !k.contains("verity") => &mut parts.usr,
             "Linux home" => &mut parts.home,
             _ => return walk_children(node, parts),
@@ -993,6 +1067,16 @@ mod tests {
         // Dry-run is rejected regardless of the home flag, so the integrity and
         // recovery steps are structurally unreachable in dry-run.
         assert!(InstallPlan::authorize(true, "/dev/sdb", "/dev/sdb", fb(), false).is_none());
+    }
+
+    #[test]
+    fn parse_usrhash_extracts_the_token() {
+        assert_eq!(
+            parse_usrhash("root=tmpfs usrhash=4aa6a2af5d1e lsm=apparmor").as_deref(),
+            Some("4aa6a2af5d1e")
+        );
+        assert_eq!(parse_usrhash("root=tmpfs lsm=apparmor"), None);
+        assert_eq!(parse_usrhash("usrhash="), None);
     }
 
     #[test]
@@ -1069,8 +1153,10 @@ mod tests {
         let parts = parse_partitions(json).unwrap();
         assert_eq!(parts.esp.as_deref(), Some("/dev/sdb1"));
         assert_eq!(parts.root.as_deref(), Some("/dev/sdb4"));
-        // The verity partition must not be picked as the /usr data partition.
+        // The verity partition must not be picked as the /usr data partition;
+        // it is captured separately as the hash device for veritysetup open.
         assert_eq!(parts.usr.as_deref(), Some("/dev/sdb2"));
+        assert_eq!(parts.usr_verity.as_deref(), Some("/dev/sdb3"));
         // No home partition in this layout (home omitted by the user).
         assert_eq!(parts.home, None);
     }

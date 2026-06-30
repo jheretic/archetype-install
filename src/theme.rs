@@ -42,7 +42,17 @@ const BANDS: [(char, Color); 4] = [('a', RED), ('r', YELLOW), ('c', GREEN), ('h'
 /// the joining [`CHEVRON`] takes the band's color as foreground over the next
 /// band's color as background, producing seamless diagonal seams.
 pub fn ribbon() -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(BANDS.len() * 2 + 1);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(BANDS.len() * 2 + 2);
+
+    // Indented left edge: a leading CHEVRON drawn as the knockout color (BG) on
+    // the first band's color, so a dark wedge points RIGHT into band 0 -- the
+    // same inward notch as the fish prompt's left cap (archetype-logo.sh).
+    if let Some((_, first_accent)) = BANDS.first() {
+        spans.push(Span::styled(
+            CHEVRON,
+            Style::default().fg(BG).bg(*first_accent),
+        ));
+    }
 
     for (index, (letter, accent)) in BANDS.iter().enumerate() {
         spans.push(Span::styled(
@@ -79,7 +89,10 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(text, " a \u{e0b0} r \u{e0b0} c \u{e0b0} h \u{e0b0}etype");
+        assert_eq!(
+            text,
+            "\u{e0b0} a \u{e0b0} r \u{e0b0} c \u{e0b0} h \u{e0b0}etype"
+        );
     }
 
     #[test]

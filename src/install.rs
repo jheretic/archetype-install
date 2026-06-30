@@ -724,7 +724,7 @@ fn mount_and_seed(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(),
 /// from `/usr/share/factory/etc` (per 70-root.conf).
 fn seed_etc(tx: &Sender<Progress>, root_mount: &Path) -> Result<(), String> {
     let _ = tx.send(Progress::Step("Seeding /etc from factory".to_string()));
-    let ok = run_cmd(
+    let code = run_cmd_code(
         tx,
         "systemd-tmpfiles",
         &[
@@ -733,10 +733,26 @@ fn seed_etc(tx: &Sender<Progress>, root_mount: &Path) -> Result<(), String> {
             "--create",
         ],
     );
-    if ok {
-        Ok(())
-    } else {
-        Err("systemd-tmpfiles failed to seed /etc from the factory tree".to_string())
+    interpret_tmpfiles_exit(code)
+}
+
+/// Interpret a `systemd-tmpfiles` exit code for the offline /etc seed.
+///
+/// Exit 65 (EX_DATAERR) = "some lines had to be ignored, but no other errors
+/// occurred" (systemd-tmpfiles(8)). On an offline --root seed this is normal and
+/// benign: tmpfiles.d rules reference users/groups not yet present in the target
+/// (audio, kvm, systemd-network, utmp, tss, ...) and factory sources for foreign
+/// C! rules (mtab, ssl/cert.pem, ca-*) we don't ship. Our own /etc defaults are
+/// still created, and systemd's own systemd-tmpfiles-setup.service does not fail
+/// the boot on 65 -- so neither do we. Only a hard failure (73 = EX_CANTCREAT,
+/// or 1) or death by signal is fatal. Pure for unit-testing.
+fn interpret_tmpfiles_exit(code: Option<i32>) -> Result<(), String> {
+    match code {
+        Some(0) | Some(65) => Ok(()),
+        Some(c) => Err(format!(
+            "systemd-tmpfiles failed to seed /etc from the factory tree (exit {c})"
+        )),
+        None => Err("systemd-tmpfiles was killed by a signal while seeding /etc".to_string()),
     }
 }
 
@@ -782,6 +798,14 @@ fn redact_arg(arg: &str) -> String {
 /// on a zero exit. A spawn failure or non-zero exit is logged as a warning but
 /// is never fatal (post-steps are best-effort; see [`post_steps`]).
 fn run_cmd(tx: &Sender<Progress>, program: &str, args: &[&str]) -> bool {
+    run_cmd_code(tx, program, args) == Some(0)
+}
+
+/// Like [`run_cmd`] but returns the process exit code: `Some(code)`, or `None`
+/// if it was killed by a signal or could not be spawned. Lets a caller accept
+/// specific non-zero codes (e.g. systemd-tmpfiles' benign 65). Logs the argv,
+/// captured output, and a warning on any non-zero/abnormal exit.
+fn run_cmd_code(tx: &Sender<Progress>, program: &str, args: &[&str]) -> Option<i32> {
     let shown: Vec<String> = args.iter().map(|a| redact_arg(a)).collect();
     log(tx, &format!("$ {program} {}", shown.join(" ")));
     match Command::new(program).args(args).output() {
@@ -791,9 +815,7 @@ fn run_cmd(tx: &Sender<Progress>, program: &str, args: &[&str]) -> bool {
                     log(tx, &format!("  {line}"));
                 }
             }
-            if output.status.success() {
-                true
-            } else {
+            if !output.status.success() {
                 warn(
                     tx,
                     &format!(
@@ -804,12 +826,12 @@ fn run_cmd(tx: &Sender<Progress>, program: &str, args: &[&str]) -> bool {
                             .map_or_else(|| "by signal".to_string(), |c| c.to_string())
                     ),
                 );
-                false
             }
+            output.status.code()
         }
         Err(err) => {
             warn(tx, &format!("failed to run {program}: {err}"));
-            false
+            None
         }
     }
 }
@@ -914,6 +936,17 @@ mod tests {
         // Dry-run is rejected regardless of the home flag, so the integrity and
         // recovery steps are structurally unreachable in dry-run.
         assert!(InstallPlan::authorize(true, "/dev/sdb", "/dev/sdb", fb(), false).is_none());
+    }
+
+    #[test]
+    fn tmpfiles_exit_65_is_tolerated() {
+        // 0 and 65 (some lines ignored, no other errors) => seed OK.
+        assert!(interpret_tmpfiles_exit(Some(0)).is_ok());
+        assert!(interpret_tmpfiles_exit(Some(65)).is_ok());
+        // 73 (EX_CANTCREAT), 1, and signal death => fatal.
+        assert!(interpret_tmpfiles_exit(Some(73)).is_err());
+        assert!(interpret_tmpfiles_exit(Some(1)).is_err());
+        assert!(interpret_tmpfiles_exit(None).is_err());
     }
 
     #[test]

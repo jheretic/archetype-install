@@ -15,8 +15,12 @@ const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
 /// `SizeMaxBytes` of each fixed partition, mirroring the canonical templates.
+/// MUST stay in lockstep with templates/10-usr.conf + 40-usr-b.conf (and the
+/// archetype-build shipped copies): this is subtracted from the disk to size
+/// the configurable root/swap/home, so an understated value over-allocates them
+/// and repart placement can fail on a tight disk.
 const ESP_BYTES: u64 = 550 * MIB;
-const USR_BYTES: u64 = 512 * MIB;
+const USR_BYTES: u64 = GIB;
 const USR_VERITY_BYTES: u64 = 64 * MIB;
 /// The `usr-verity-sig` templates carry no `SizeMaxBytes`; repart sizes them to
 /// the (tiny) signature payload. We reserve a fixed amount per slot for the

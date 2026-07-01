@@ -149,7 +149,7 @@ mod tests {
             ),
             (
                 "10-usr.conf",
-                "[Partition]\nType=usr\nLabel=%M_%A\nSizeMinBytes=512M\nSizeMaxBytes=512M\nVerity=data\nVerityMatchKey=usr\n# Clone the running system's verity /usr block-for-block (self-install), NOT\n# Format= an empty squashfs. CopyBlocks and Format are mutually exclusive.\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr\nLabel=%M_%A\n# 1G (not the ~512M current /usr) for update headroom: /usr is built\n# Minimize=best (variable) and grows, and `miz -Iu` writes a whole new /usr\n# image into the OTHER slot, which must be able to hold a larger-than-current\n# image (a slot sized to today's clone caused the update out-of-space). With\n# CopyBlocks, repart sizes the partition to max(source-size, SizeMinBytes), so\n# the clone fits now and a bigger image fits later; the tail is unused space.\nSizeMinBytes=1G\nSizeMaxBytes=1G\nVerity=data\nVerityMatchKey=usr\n# Clone the running system's verity /usr block-for-block (self-install), NOT\n# Format= an empty squashfs. CopyBlocks and Format are mutually exclusive.\nCopyBlocks=auto\n",
             ),
             (
                 "20-usr-verity.conf",
@@ -161,7 +161,7 @@ mod tests {
             ),
             (
                 "40-usr-b.conf",
-                "[Partition]\nType=usr\nLabel=%M_%A\nSizeMinBytes=512M\nSizeMaxBytes=512M\nVerity=data\nVerityMatchKey=usr-b\n# Mirror of the A slot (10-usr): clone the running /usr block-for-block so the\n# installed system can boot from either slot immediately. The A/B updater\n# overwrites this on the first image update.\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr\nLabel=%M_%A\n# 1G to match the A slot (10-usr) -- this is the slot `miz -Iu` writes the next\n# /usr image into, so it must hold a larger-than-current image. See 10-usr.conf.\nSizeMinBytes=1G\nSizeMaxBytes=1G\nVerity=data\nVerityMatchKey=usr-b\n# Mirror of the A slot (10-usr): clone the running /usr block-for-block so the\n# installed system can boot from either slot immediately. The A/B updater\n# overwrites this on the first image update.\nCopyBlocks=auto\n",
             ),
             (
                 "50-usr-verity-b.conf",

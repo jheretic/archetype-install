@@ -698,6 +698,19 @@ fn mount_and_seed(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(),
         ));
     }
 
+    // The target root is a freshly-formatted, EMPTY btrfs (70-root.conf has no
+    // CopyFiles). systemd's switch-root moves the API filesystems (/dev /proc
+    // /sys /run) onto the new root and requires those mountpoints to already
+    // exist there (switch-root.c chase()s each without CHASE_NONEXISTENT) -- an
+    // empty root makes switch-root fail with "Failed to resolve /sysroot/dev"
+    // and the machine reboot-loops. The live image sidesteps this because its
+    // root is root=tmpfs, built by PID1. A persistent disk root must carry the
+    // skeleton, so create it here before seeding /etc.
+    if let Err(detail) = create_root_skeleton(root_mount) {
+        detach_root(tx);
+        return Err(detail);
+    }
+
     let usr = match parts.usr.as_ref() {
         Some(usr) => usr,
         None => {
@@ -783,6 +796,60 @@ fn parse_usrhash(cmdline: &str) -> Option<String> {
         .split_whitespace()
         .find_map(|tok| tok.strip_prefix("usrhash=").map(str::to_string))
         .filter(|h| !h.is_empty())
+}
+
+/// Top-level root entries the installer never replicates onto the target:
+/// `usr` is mounted separately (dm-verity); `etc` is seeded from the factory
+/// tree by [`seed_etc`]; `home` is created by [`integrity_home`]. Everything
+/// else at `/` (the `filesystem` package's dirs `dev proc sys run tmp var` and
+/// the usr-merge symlinks `bin lib lib64 sbin`) must be replicated.
+const ROOT_SKELETON_SKIP: [&str; 3] = ["usr", "etc", "home"];
+
+/// Replicate the live root's top-level skeleton onto the freshly-formatted,
+/// EMPTY target btrfs so switch-root can move the API filesystems (/dev /proc
+/// /sys /run) onto it -- systemd's switch-root requires those mountpoints to
+/// pre-exist (switch-root.c chase()s each without CHASE_NONEXISTENT), and an
+/// empty root reboot-loops with "Failed to resolve /sysroot/dev". It also needs
+/// the usr-merge symlinks (/bin -> usr/bin, /lib, /lib64, /sbin) or PID1 on the
+/// new root can't resolve interpreter/binary paths.
+///
+/// The running installer IS on the exact root layout the installed system
+/// needs, so we mirror `/` directly (ground truth, no drift from the
+/// `filesystem` package): symlinks copied verbatim, directories created empty
+/// (they are mountpoints or tmpfs-populated at runtime). `usr`/`etc`/`home` are
+/// skipped (handled elsewhere).
+fn create_root_skeleton(root_mount: &Path) -> Result<(), String> {
+    let entries = std::fs::read_dir("/")
+        .map_err(|err| format!("could not read the live root skeleton at /: {err}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("could not read a / entry: {err}"))?;
+        let name = entry.file_name();
+        if ROOT_SKELETON_SKIP
+            .iter()
+            .any(|skip| name.as_os_str() == *skip)
+        {
+            continue;
+        }
+        let meta = entry
+            .path()
+            .symlink_metadata()
+            .map_err(|err| format!("could not stat /{}: {err}", name.to_string_lossy()))?;
+        let dest = root_mount.join(&name);
+        if meta.is_symlink() {
+            let target = std::fs::read_link(entry.path()).map_err(|err| {
+                format!("could not read symlink /{}: {err}", name.to_string_lossy())
+            })?;
+            // Recreate the symlink verbatim; ignore if it already exists.
+            if !dest.exists() {
+                std::os::unix::fs::symlink(&target, &dest)
+                    .map_err(|err| format!("could not create symlink {}: {err}", dest.display()))?;
+            }
+        } else if meta.is_dir() {
+            std::fs::create_dir_all(&dest)
+                .map_err(|err| format!("could not create root dir {}: {err}", dest.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// `systemd-tmpfiles --root=<target> --boot --create`: seed persistent `/etc`

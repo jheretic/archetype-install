@@ -157,10 +157,13 @@ impl Install {
 pub fn spawn(plan: InstallPlan) -> Install {
     // The worker sends Progress over `work_tx`. A forwarder thread tees every
     // message to a persistent log (so the record survives the TUI teardown and
-    // can be read on a failed/incomplete install) AND to stderr (captured by
-    // the journal when run via archetype-install.service), then forwards to the
-    // UI receiver. This keeps the 17 worker fns unchanged -- they still just
-    // send Progress -- while making the install fully debuggable.
+    // can be read on a failed/incomplete install), then forwards to the UI
+    // receiver. This keeps the 17 worker fns unchanged -- they still just send
+    // Progress -- while making the install fully debuggable. NOTE: we do NOT
+    // also write stderr: the installer always runs as the ratatui TUI inside
+    // kmscon on tty1 (archetype-install.service), so stderr shares that terminal
+    // and any write corrupts the rendered display. The log file is the debug
+    // channel; read /run/archetype-install/install.log.
     let (work_tx, work_rx) = mpsc::channel::<Progress>();
     let (ui_tx, ui_rx) = mpsc::channel::<Progress>();
 
@@ -179,8 +182,9 @@ pub fn spawn(plan: InstallPlan) -> Install {
 const LOG_PATH: &str = "/run/archetype-install/install.log";
 
 /// Forward every Progress message from the worker to the UI, teeing each to the
-/// install log file and stderr first. Best-effort: a logging failure never
-/// blocks the install or the UI.
+/// install log file first. Best-effort: a logging failure never blocks the
+/// install or the UI. Deliberately does NOT write stderr -- see [`spawn`]: the
+/// TUI owns this terminal, so stderr would corrupt the display.
 fn tee_progress(work_rx: Receiver<Progress>, ui_tx: Sender<Progress>) {
     use std::io::Write;
     let mut logfile = std::fs::create_dir_all("/run/archetype-install")
@@ -194,8 +198,6 @@ fn tee_progress(work_rx: Receiver<Progress>, ui_tx: Sender<Progress>) {
         });
     while let Ok(msg) = work_rx.recv() {
         if let Some(line) = render_log_line(&msg) {
-            // stderr -> journal when run as a service.
-            eprintln!("{line}");
             if let Some(f) = logfile.as_mut() {
                 let _ = writeln!(f, "{line}");
                 let _ = f.flush();

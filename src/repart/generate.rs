@@ -161,15 +161,15 @@ mod tests {
             ),
             (
                 "40-usr-b.conf",
-                "[Partition]\nType=usr\nLabel=%M_%A\n# 1G to match the A slot (10-usr) -- this is the slot `miz -Iu` writes the next\n# /usr image into, so it must hold a larger-than-current image. See 10-usr.conf.\nSizeMinBytes=1G\nSizeMaxBytes=1G\nVerity=data\nVerityMatchKey=usr-b\n# Mirror of the A slot (10-usr): clone the running /usr block-for-block so the\n# installed system can boot from either slot immediately. The A/B updater\n# overwrites this on the first image update.\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr\n# Label=_empty (NOT %M_%A, and NOT CopyBlocks-cloned): the B slot must be an\n# EMPTY sysupdate target at install time. If B were cloned + labeled %M_%A like\n# A, both slots carry the SAME version == the running (ProtectVersion=%A)\n# version, so the first `miz -Iu` has NO freeable slot -> \"Version '<v>' is\n# protected, not removing\" -> \"No available partition of a suitable size found\".\n# _empty is sysupdate's canonical free slot (sysupdate.d(5)); the first update\n# writes the new /usr here and labels it archetype_<newversion>. Tradeoff: B is\n# not a bootable clone until that first update -- acceptable, boot always uses A\n# (selected by usrhash), and gpt-auto ignores _empty slots.\nLabel=_empty\nSizeMinBytes=1G\nSizeMaxBytes=1G\nVerity=data\nVerityMatchKey=usr-b\n",
             ),
             (
                 "50-usr-verity-b.conf",
-                "[Partition]\nType=usr-verity\nLabel=%M_%A_verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr-b\n# Mirror of the A slot (20-usr-verity): clone the running verity hash partition\n# block-for-block. The A/B updater replaces it on the first image update.\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr-verity\n# Empty B verity slot -- see 40-usr-b.conf. sysupdate writes data+hash+sig\n# together into the empty B set on the first update.\nLabel=_empty\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr-b\n",
             ),
             (
                 "60-usr-verity-sig-b.conf",
-                "[Partition]\nType=usr-verity-sig\nLabel=%M_%A_verity_sig\nVerity=signature\nVerityMatchKey=usr-b\n# Mirror of the A slot (30-usr-verity-sig): clone the running signature\n# partition. The A/B updater replaces it on the first image update.\nCopyBlocks=auto\n",
+                "[Partition]\nType=usr-verity-sig\n# Empty B verity-sig slot -- see 40-usr-b.conf.\nLabel=_empty\nVerity=signature\nVerityMatchKey=usr-b\n",
             ),
         ])
     }

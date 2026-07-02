@@ -980,7 +980,48 @@ fn populate_esp(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(), S
     }
 
     let _ = umount(tx, mnt);
+
+    // Mount the ESP at /efi on the INSTALLED system. The ESP is populated above,
+    // but nothing mounts it at runtime: gpt-auto's ESP automount is conditional
+    // (LoaderDevicePartUUID must match + /efi|/boot empty) and does not fire on
+    // our layout, so without an explicit fstab entry the ESP stays unmounted.
+    // systemd-sysupdate's UKI transfer (90-uki.transfer, PathRelativeTo=esp)
+    // then can't resolve the ESP -> "Required key not available" -> no host
+    // target -> `miz -I` "no such component: host". An fstab mount by the ESP's
+    // stable PARTLABEL (00-efi.conf Label=archetype-esp) fixes it, and gpt-auto
+    // defers to fstab. The mountpoint /efi doesn't exist on the target yet (the
+    // live root has none to mirror), so create it; systemd would also create it,
+    // but being explicit is harmless.
+    let root_mount = Path::new(TARGET_MOUNT);
+    if let Err(err) = std::fs::create_dir_all(root_mount.join("efi")) {
+        warn(tx, &format!("could not create /efi mountpoint: {err}"));
+    }
+    if let Err(detail) = append_line(&root_mount.join("etc/fstab"), &esp_fstab_line()) {
+        // Non-fatal: the install is otherwise complete and bootable; only image
+        // updates (miz -Iu) need the ESP mounted. Surface it, don't abort.
+        warn(
+            tx,
+            &format!("could not write the ESP fstab entry: {detail}"),
+        );
+    }
     Ok(())
+}
+
+/// GPT PARTLABEL assigned to the ESP by the installer's repart config
+/// (00-efi.conf `Label=archetype-esp`). Used to mount it stably via fstab.
+const ESP_PARTLABEL: &str = "archetype-esp";
+
+/// The `/etc/fstab` line mounting the ESP at `/efi` on the installed system, by
+/// its stable PARTLABEL. `umask=0077` keeps the vfat ESP root-only (it holds
+/// boot artifacts). `nofail` so a missing/again-unmounted ESP never blocks boot;
+/// `x-systemd.automount` mounts it lazily on first access (e.g. by sysupdate).
+///
+/// PARTLABEL (not PARTUUID) is deterministic and needs no runtime lookup, at the
+/// cost of ambiguity if two Archetype disks are attached at once -- acceptable
+/// for the single-install target; revisit with the target ESP's PARTUUID if
+/// multi-disk installs become a concern.
+fn esp_fstab_line() -> String {
+    format!("PARTLABEL={ESP_PARTLABEL}\t/efi\tvfat\tumask=0077,nofail,x-systemd.automount\t0\t2\n")
 }
 
 /// `umount <path>`, logged. Returns true on success.
@@ -1360,6 +1401,14 @@ mod tests {
         assert_eq!(
             home_fstab_line(),
             "/dev/mapper/home\t/home\tbtrfs\tdefaults,x-systemd.requires=/dev/mapper/home\t0\t0\n"
+        );
+    }
+
+    #[test]
+    fn esp_fstab_line_mounts_esp_at_efi_by_partlabel() {
+        assert_eq!(
+            esp_fstab_line(),
+            "PARTLABEL=archetype-esp\t/efi\tvfat\tumask=0077,nofail,x-systemd.automount\t0\t2\n"
         );
     }
 

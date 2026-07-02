@@ -145,7 +145,7 @@ mod tests {
         HashMap::from([
             (
                 "00-efi.conf",
-                "[Partition]\nType=esp\nSizeMinBytes=550M\nSizeMaxBytes=550M\nFormat=vfat\n",
+                "[Partition]\nType=esp\n# Stable PARTLABEL so the installed system can mount the ESP by label in\n# /etc/fstab (installer esp_fstab_line). Without a mounted ESP, sysupdate's UKI\n# transfer (90-uki.transfer, PathRelativeTo=esp) can't resolve the ESP and fails\n# with \"Required key not available\" -> no host target -> `miz -I` \"no such\n# component: host\". gpt-auto's ESP automount is conditional (LoaderDevicePartUUID\n# + an empty /efi|/boot) and does not fire here, so we mount it explicitly.\nLabel=archetype-esp\nSizeMinBytes=550M\nSizeMaxBytes=550M\nFormat=vfat\n",
             ),
             (
                 "10-usr.conf",

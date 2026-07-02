@@ -161,15 +161,15 @@ mod tests {
             ),
             (
                 "40-usr-b.conf",
-                "[Partition]\nType=usr\n# Label=_empty (NOT %M_%A, and NOT CopyBlocks-cloned): the B slot must be an\n# EMPTY sysupdate target at install time. If B were cloned + labeled %M_%A like\n# A, both slots carry the SAME version == the running (ProtectVersion=%A)\n# version, so the first `miz -Iu` has NO freeable slot -> \"Version '<v>' is\n# protected, not removing\" -> \"No available partition of a suitable size found\".\n# _empty is sysupdate's canonical free slot (sysupdate.d(5)); the first update\n# writes the new /usr here and labels it archetype_<newversion>. Tradeoff: B is\n# not a bootable clone until that first update -- acceptable, boot always uses A\n# (selected by usrhash), and gpt-auto ignores _empty slots.\nLabel=_empty\nSizeMinBytes=1G\nSizeMaxBytes=1G\nVerity=data\nVerityMatchKey=usr-b\n",
+                "[Partition]\nType=usr\n# Label=archetype_1970.01.01-1 (a valid but ancient dummy version), NOT\n# CopyBlocks-cloned. The B slot must be a sysupdate OVERWRITE target at install.\n# A _empty label does NOT work: sysupdate only considers /usr partitions whose\n# label matches the transfer MatchPattern=archetype_@v as candidate slots, and\n# _empty doesn't match -> \"No available partition of a suitable size found\".\n# And cloning B + labeling it %M_%A like A gives both slots the SAME version ==\n# the running (ProtectVersion=%A-protected) version -> no freeable slot -> the\n# same failure. A matching-but-oldest version fixes both: it matches @v, and\n# sorts older than any real version (1970 << 20xx) so it is never %A and is\n# always the overwrite target. First `miz -Iu` writes the new /usr here + labels\n# it archetype_<newversion>. Not cloned/bootable (its ancient label never wins\n# gpt-auto's newest-version pick); boot always uses A (via usrhash) until then.\nLabel=archetype_1970.01.01-1\nSizeMinBytes=1G\nSizeMaxBytes=1G\nVerity=data\nVerityMatchKey=usr-b\n",
             ),
             (
                 "50-usr-verity-b.conf",
-                "[Partition]\nType=usr-verity\n# Empty B verity slot -- see 40-usr-b.conf. sysupdate writes data+hash+sig\n# together into the empty B set on the first update.\nLabel=_empty\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr-b\n",
+                "[Partition]\nType=usr-verity\n# Ancient-dummy-version B verity slot -- see 40-usr-b.conf. Must match\n# MatchPattern=archetype_@v_verity and sort oldest; sysupdate writes\n# data+hash+sig together into the B set on the first update.\nLabel=archetype_1970.01.01-1_verity\nSizeMinBytes=64M\nSizeMaxBytes=64M\nVerity=hash\nVerityMatchKey=usr-b\n",
             ),
             (
                 "60-usr-verity-sig-b.conf",
-                "[Partition]\nType=usr-verity-sig\n# Empty B verity-sig slot -- see 40-usr-b.conf.\nLabel=_empty\nVerity=signature\nVerityMatchKey=usr-b\n",
+                "[Partition]\nType=usr-verity-sig\n# Ancient-dummy-version B verity-sig slot -- see 40-usr-b.conf. Matches\n# MatchPattern=archetype_@v_verity_sig, sorts oldest.\nLabel=archetype_1970.01.01-1_verity_sig\nVerity=signature\nVerityMatchKey=usr-b\n",
             ),
         ])
     }

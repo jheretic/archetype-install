@@ -692,10 +692,48 @@ fn mount_and_seed(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(),
     // Root is now OPEN. Any failure past this point must detach_root before
     // returning so we don't leak an unlocked encrypted volume.
     let opened = format!("/dev/mapper/{ROOT_VOLUME}");
+
+    // Create a per-version root subvolume @archetype_<version> and seed EVERYTHING
+    // into it (not the btrfs top-level). The version is the running image's
+    // IMAGE_VERSION == the version whose UKI we install, and that UKI is built
+    // with rootflags=subvol=@archetype_<version> (mkosi build), so gpt-auto mounts
+    // this exact subvolume as / at boot. `miz -Iu` later snapshots it to
+    // @archetype_<newversion> for the new UKI, so each UKI is pinned to a matching
+    // root snapshot -- a /usr rollback brings the layered packages that match its
+    // deps. We do NOT btrfs-set-default: rootflags= on each UKI's cmdline is the
+    // pinning (a global default would fight a rollback).
+    let version = read_image_version().ok_or_else(|| {
+        "could not read IMAGE_VERSION from /usr/lib/os-release; cannot name the \
+         root subvolume to match the UKI's rootflags=subvol="
+            .to_string()
+    })?;
+    let subvol = root_subvol_name(&version);
+
+    // Mount the btrfs top-level to create the subvolume, then remount the
+    // subvolume itself at root_mount as the seed target.
     if !try_mount(tx, &opened, root_mount) {
         detach_root(tx);
         return Err(format!(
             "unlocked root {opened} but could not mount it at {TARGET_MOUNT} \
+             (recoverable, no reboot)"
+        ));
+    }
+    let subvol_path = root_mount.join(&subvol);
+    if !run_cmd(
+        tx,
+        "btrfs",
+        &["subvolume", "create", &subvol_path.display().to_string()],
+    ) {
+        run_cmd(tx, "umount", &[&root_mount.display().to_string()]);
+        run_cmd(tx, CRYPTSETUP_BIN, &["detach", ROOT_VOLUME]);
+        return Err(format!("could not create root subvolume {subvol}"));
+    }
+    log(tx, &format!("created root subvolume {subvol}"));
+    run_cmd(tx, "umount", &[&root_mount.display().to_string()]);
+    if !try_mount_opts(tx, &opened, root_mount, &format!("subvol={subvol}")) {
+        detach_root(tx);
+        return Err(format!(
+            "created subvolume {subvol} but could not mount it at {TARGET_MOUNT} \
              (recoverable, no reboot)"
         ));
     }
@@ -1035,6 +1073,42 @@ fn try_mount(tx: &Sender<Progress>, source: &str, target: &Path) -> bool {
     run_cmd(tx, "mount", &[source, &target.display().to_string()])
 }
 
+/// `mount -o <opts> <source> <target>`. Used to mount a specific btrfs
+/// subvolume (`subvol=...`) as the target root.
+fn try_mount_opts(tx: &Sender<Progress>, source: &str, target: &Path, opts: &str) -> bool {
+    run_cmd(
+        tx,
+        "mount",
+        &["-o", opts, source, &target.display().to_string()],
+    )
+}
+
+/// The running image's `IMAGE_VERSION` from `/usr/lib/os-release` -- the version
+/// being installed (the installer clones the running /usr). Names the root
+/// subvolume to match the installed UKI's baked-in rootflags=subvol=.
+fn read_image_version() -> Option<String> {
+    let text = std::fs::read_to_string("/usr/lib/os-release")
+        .or_else(|_| std::fs::read_to_string("/etc/os-release"))
+        .ok()?;
+    parse_image_version(&text)
+}
+
+/// Extract `IMAGE_VERSION=<v>` from os-release text (optionally quoted). Pure,
+/// for testing.
+fn parse_image_version(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("IMAGE_VERSION="))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The root subvolume name for `version`: `@archetype_<version>`. MUST match the
+/// UKI's baked-in `rootflags=subvol=` (built in archetype-build) and miz -Iu's
+/// snapshot naming. Pure, for testing.
+fn root_subvol_name(version: &str) -> String {
+    format!("@archetype_{version}")
+}
+
 /// Redact secret-bearing argv flags before they are logged to the progress TUI.
 /// The root password hash must never appear in the on-screen log.
 fn redact_arg(arg: &str) -> String {
@@ -1200,6 +1274,21 @@ mod tests {
         // Dry-run is rejected regardless of the home flag, so the integrity and
         // recovery steps are structurally unreachable in dry-run.
         assert!(InstallPlan::authorize(true, "/dev/sdb", "/dev/sdb", fb(), false).is_none());
+    }
+
+    #[test]
+    fn parse_image_version_and_subvol_name() {
+        assert_eq!(
+            parse_image_version("NAME=x\nIMAGE_VERSION=2026.07.01-7\nID=archetype\n").as_deref(),
+            Some("2026.07.01-7")
+        );
+        assert_eq!(
+            parse_image_version("IMAGE_VERSION=\"2026.07.01-7\"\n").as_deref(),
+            Some("2026.07.01-7")
+        );
+        assert_eq!(parse_image_version("NAME=x\nID=archetype\n"), None);
+        assert_eq!(parse_image_version("IMAGE_VERSION=\n"), None);
+        assert_eq!(root_subvol_name("2026.07.01-7"), "@archetype_2026.07.01-7");
     }
 
     #[test]

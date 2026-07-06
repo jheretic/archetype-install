@@ -1017,6 +1017,21 @@ fn populate_esp(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(), S
         );
     }
 
+    // Install the per-version rootflags addon so the installed UKI pins its
+    // matching @archetype_<version> root subvolume. rootflags=subvol= is NOT in
+    // the base UKI cmdline (it would break the live boot's root=tmpfs, see
+    // archetype-build mkosi.conf); systemd-stub applies addons in
+    // EFI/Linux/<uki>.efi.extra.d/ ONLY to that UKI. The signed addon is baked
+    // into /usr (mounted at TARGET_MOUNT/usr); copy it beside the UKI we just
+    // wrote. Non-fatal-but-loud: without it, gpt-auto mounts the btrfs default
+    // (top-level, not a seeded @archetype_<v>) -> broken boot, so warn clearly.
+    if let Err(detail) = install_rootflags_addon(tx, mnt) {
+        warn(
+            tx,
+            &format!("could not install the rootflags addon: {detail}"),
+        );
+    }
+
     let _ = umount(tx, mnt);
 
     // Mount the ESP at /efi on the INSTALLED system. The ESP is populated above,
@@ -1048,6 +1063,35 @@ fn populate_esp(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(), S
 /// GPT PARTLABEL assigned to the ESP by the installer's repart config
 /// (00-efi.conf `Label=archetype-esp`). Used to mount it stably via fstab.
 const ESP_PARTLABEL: &str = "archetype-esp";
+
+/// The rootflags addon baked into /usr (archetype-build scripts/rootflags_addon.sh),
+/// relative to the mounted target root. Copied onto the target ESP so the
+/// installed UKI pins its @archetype_<version> root subvolume.
+const ROOTFLAGS_ADDON_SRC: &str = "usr/lib/archetype/rootflags.addon.efi";
+
+/// Copy the per-version rootflags addon into the target ESP's
+/// `EFI/Linux/archetype_<version>.efi.extra.d/`. `esp_mnt` is the mounted target
+/// ESP. The source is the addon baked into the (mounted) target /usr; the
+/// version names the extra.d dir to match the UKI written beside it (systemd-stub
+/// resolves `<uki>.efi.extra.d/` for `archetype_<version>.efi`).
+fn install_rootflags_addon(tx: &Sender<Progress>, esp_mnt: &Path) -> Result<(), String> {
+    let version = read_image_version().ok_or_else(|| "could not read IMAGE_VERSION".to_string())?;
+    let src = Path::new(TARGET_MOUNT).join(ROOTFLAGS_ADDON_SRC);
+    if !src.exists() {
+        return Err(format!("addon not found at {}", src.display()));
+    }
+    let extra_d = esp_mnt.join(format!("EFI/Linux/archetype_{version}.efi.extra.d"));
+    std::fs::create_dir_all(&extra_d)
+        .map_err(|e| format!("could not create {}: {e}", extra_d.display()))?;
+    let dst = extra_d.join("rootflags.addon.efi");
+    std::fs::copy(&src, &dst)
+        .map_err(|e| format!("could not copy addon to {}: {e}", dst.display()))?;
+    log(
+        tx,
+        &format!("installed rootflags addon -> {}", dst.display()),
+    );
+    Ok(())
+}
 
 /// The `/etc/fstab` line mounting the ESP at `/efi` on the installed system, by
 /// its stable PARTLABEL. `umask=0077` keeps the vfat ESP root-only (it holds

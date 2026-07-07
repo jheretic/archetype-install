@@ -1002,6 +1002,20 @@ fn populate_esp(parts: &TargetPartitions, tx: &Sender<Progress>) -> Result<(), S
         return Err("failed to copy the bootloader/UKI to the target ESP".to_string());
     }
 
+    // Rename the copied UKI to archetype_<version>.efi. mkosi names the built UKI
+    // <token>-<kver>-<roothash>.efi (its default &e-&k-&h format; no version
+    // specifier exists), but the whole convention -- sd-stub's per-UKI addon dir
+    // (<uki>.efi.extra.d), sysupdate's MatchPattern=archetype_@v.efi, and this
+    // installer's rootflags-addon dir -- assumes archetype_<version>.efi. CI
+    // already publishes the split UKI artifact under that name, so future
+    // sysupdate updates match; only the in-image live ESP carries the long name,
+    // and the copy above brings it verbatim. Rename it here so the fresh ESP is
+    // consistent (and so the extra.d dir below matches -> rootflags applies).
+    if let Err(detail) = rename_uki_to_versioned(tx, mnt) {
+        let _ = umount(tx, mnt);
+        return Err(detail);
+    }
+
     // bootctl install: write the removable fallback EFI/BOOT/BOOTX64.EFI + a
     // systemd-boot entry into the target ESP. --no-variables: don't touch the
     // live firmware's NVRAM boot order (the target boots via the fallback path).
@@ -1068,6 +1082,52 @@ const ESP_PARTLABEL: &str = "archetype-esp";
 /// relative to the mounted target root. Copied onto the target ESP so the
 /// installed UKI pins its @archetype_<version> root subvolume.
 const ROOTFLAGS_ADDON_SRC: &str = "usr/lib/archetype/rootflags.addon.efi";
+
+/// Rename the copied UKI under `<esp>/EFI/Linux/` to `archetype_<version>.efi`.
+///
+/// mkosi builds the UKI with its default `&e-&k-&h` name
+/// (`archetype-<kver>-<roothash>.efi`); every downstream consumer instead assumes
+/// `archetype_<version>.efi` (sd-stub resolves the per-UKI addon dir as
+/// `<uki>.efi.extra.d`, sysupdate matches `archetype_@v.efi`). Find the single
+/// UKI in `EFI/Linux/` and rename it. If it is already correctly named (or a
+/// future build sets a matching name), this is a no-op.
+fn rename_uki_to_versioned(tx: &Sender<Progress>, esp_mnt: &Path) -> Result<(), String> {
+    let version = read_image_version().ok_or_else(|| "could not read IMAGE_VERSION".to_string())?;
+    let target_name = format!("archetype_{version}.efi");
+    let linux_dir = esp_mnt.join("EFI/Linux");
+    let target = linux_dir.join(&target_name);
+    if target.exists() {
+        return Ok(()); // already correctly named
+    }
+    // Collect the UKIs present (bare .efi files, not the .efi.extra.d dirs).
+    let mut ukis: Vec<PathBuf> = Vec::new();
+    let entries = std::fs::read_dir(&linux_dir)
+        .map_err(|e| format!("could not read {}: {e}", linux_dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|e| e == "efi") {
+            ukis.push(path);
+        }
+    }
+    match ukis.as_slice() {
+        [uki] => {
+            std::fs::rename(uki, &target).map_err(|e| {
+                format!(
+                    "could not rename {} -> {}: {e}",
+                    uki.display(),
+                    target.display()
+                )
+            })?;
+            log(tx, &format!("renamed UKI -> {target_name}"));
+            Ok(())
+        }
+        [] => Err(format!("no UKI (*.efi) found in {}", linux_dir.display())),
+        _ => Err(format!(
+            "multiple UKIs in {}; cannot pick which to rename to {target_name}",
+            linux_dir.display()
+        )),
+    }
+}
 
 /// Copy the per-version rootflags addon into the target ESP's
 /// `EFI/Linux/archetype_<version>.efi.extra.d/`. `esp_mnt` is the mounted target

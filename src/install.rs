@@ -588,11 +588,15 @@ fn cryptenroll_recovery_args(root_device: &str) -> Vec<String> {
 /// - `--tpm2-device=auto --tpm2-with-pin=yes`: add a new TPM2 slot that also
 ///   requires the PIN (supplied out-of-band via the credentials dir, see
 ///   [`enroll_tpm2_pin`]; never on argv).
-/// - `--tpm2-public-key-pcrs=11`: bind to a SIGNED PCR-11 policy. The public key
-///   is auto-discovered at /usr/lib/systemd/tpm2-pcr-public-key.pem (shipped in
-///   the image). No `--tpm2-signature` is given, so no enroll-time safety check
-///   against the installer's (different) PCR 11 -- the policy binds to the KEY,
-///   and each installed UKI's embedded .pcrsig satisfies it at boot.
+/// - `--tpm2-public-key=<PCR_PUBLIC_KEY_PATH> --tpm2-public-key-pcrs=11`: bind to
+///   a SIGNED PCR-11 policy. The path is passed EXPLICITLY (not relying on
+///   auto-discovery): with only the PCR mask and a missing key file,
+///   systemd-cryptenroll does NOT fail closed -- it sets pubkey_pcr_mask=0 and
+///   silently enrolls PIN-only, WITHOUT the signed policy (verified against
+///   systemd cryptenroll-tpm2.c). [`enroll_tpm2_pin`] additionally preflights
+///   that the file exists. No `--tpm2-signature` is given, so no enroll-time
+///   safety check against the installer's (different) PCR 11 -- the policy binds
+///   to the KEY, and each installed UKI's embedded .pcrsig satisfies it at boot.
 /// - `--wipe-slot=tpm2`: after the new slot is added, wipe the old PIN-less TPM2
 ///   slot so the root can no longer auto-unlock without the PIN. The newly added
 ///   slot is always excluded from the wipe (systemd-cryptenroll(1)).
@@ -601,11 +605,18 @@ fn cryptenroll_pin_args(root_device: &str) -> Vec<String> {
         "--unlock-tpm2-device=auto".to_string(),
         "--tpm2-device=auto".to_string(),
         "--tpm2-with-pin=yes".to_string(),
+        format!("--tpm2-public-key={PCR_PUBLIC_KEY_PATH}"),
         "--tpm2-public-key-pcrs=11".to_string(),
         "--wipe-slot=tpm2".to_string(),
         root_device.to_string(),
     ]
 }
+
+/// The signed-PCR-policy public key shipped in the image (archetype-build CI
+/// extracts it from the PCR cert into mkosi.skeleton). Passed explicitly to
+/// systemd-cryptenroll so a missing key fails the install rather than silently
+/// downgrading to PIN-only (no signed PCR-11 policy).
+const PCR_PUBLIC_KEY_PATH: &str = "/usr/lib/systemd/tpm2-pcr-public-key.pem";
 
 /// Re-enroll the root TPM2 keyslot with a PIN + signed PCR-11 policy, replacing
 /// the PIN-less slot. Runs only in PIN mode (`firstboot.tpm_pin.is_some()`), and
@@ -614,17 +625,31 @@ fn cryptenroll_pin_args(root_device: &str) -> Vec<String> {
 /// The PIN is passed via the systemd credentials directory
 /// (`$CREDENTIALS_DIRECTORY`/`cryptenroll.new-tpm2-pin`), never on argv/env, so
 /// it never reaches the process list or the progress log. The temp dir is
-/// created 0700, the file 0600, and both are removed before returning.
+/// created 0700, the file 0600, and is scrubbed on EVERY return path by a
+/// [`ScrubGuard`] (so an early error can't leave the plaintext PIN behind).
 fn enroll_tpm2_pin(root_device: &str, pin: &str, tx: &Sender<Progress>) -> Result<(), String> {
     let _ = tx.send(Progress::Step(
         "Enrolling TPM2 PIN + signed PCR policy on the root".to_string(),
     ));
 
-    // Credentials dir: 0700 dir holding cryptenroll.new-tpm2-pin (0600).
+    // Fail closed if the signed-PCR public key is missing: without it,
+    // systemd-cryptenroll would silently enroll PIN-only (no signed PCR-11
+    // policy), a security downgrade. Better to abort the install than ship a
+    // system that looks hardened but isn't.
+    if !Path::new(PCR_PUBLIC_KEY_PATH).exists() {
+        return Err(format!(
+            "signed-PCR public key {PCR_PUBLIC_KEY_PATH} not found; refusing to \
+             enroll a PIN slot that would silently lack the signed PCR-11 policy"
+        ));
+    }
+
+    // Credentials dir: 0700 dir holding cryptenroll.new-tpm2-pin (0600). The
+    // guard removes it when this function returns, on ANY path.
     let cred_dir = Path::new(TARGET_MOUNT).with_file_name("cryptenroll-creds");
     let _ = std::fs::remove_dir_all(&cred_dir); // clear any stale dir from a prior run
     std::fs::create_dir_all(&cred_dir)
         .map_err(|e| format!("could not create credentials dir: {e}"))?;
+    let _scrub = ScrubGuard(cred_dir.clone());
     set_mode(&cred_dir, 0o700)?;
     let cred_file = cred_dir.join("cryptenroll.new-tpm2-pin");
     std::fs::write(&cred_file, pin).map_err(|e| format!("could not write PIN credential: {e}"))?;
@@ -634,20 +659,22 @@ fn enroll_tpm2_pin(root_device: &str, pin: &str, tx: &Sender<Progress>) -> Resul
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     // Log the argv (no secret in it) but NOT stdout/stderr (defensive).
     log(tx, &format!("$ systemd-cryptenroll {}", arg_refs.join(" ")));
-    let result = Command::new("systemd-cryptenroll")
+    let output = Command::new("systemd-cryptenroll")
         .args(&args)
         .env("CREDENTIALS_DIRECTORY", &cred_dir)
-        .output();
-
-    // Always scrub the credential (best effort) before evaluating the result.
-    let _ = std::fs::remove_dir_all(&cred_dir);
-
-    let output = result.map_err(|err| format!("failed to run systemd-cryptenroll: {err}"))?;
+        .output()
+        .map_err(|err| format!("failed to run systemd-cryptenroll: {err}"))?;
     if !output.status.success() {
+        // The invocation combines enroll + wipe (enroll first, then wipe the old
+        // slot). A non-zero exit may mean the enroll failed OR the enroll
+        // succeeded but the wipe failed -- so don't assert the slot state; tell
+        // the operator to inspect the LUKS header. The recovery key still works
+        // regardless (enrolled earlier), so the system is not locked out.
         return Err(format!(
-            "systemd-cryptenroll (TPM2 PIN) exited {}; the root is encrypted and \
-             still unlockable via the recovery key, but the PIN slot was not \
-             enrolled",
+            "systemd-cryptenroll (TPM2 PIN + wipe) exited {}; the root is encrypted \
+             and still unlockable via the recovery key, but the final TPM2 PIN \
+             re-enroll/wipe did not complete cleanly -- inspect the LUKS2 keyslots \
+             before relying on PIN unlock",
             output
                 .status
                 .code()
@@ -655,6 +682,17 @@ fn enroll_tpm2_pin(root_device: &str, pin: &str, tx: &Sender<Progress>) -> Resul
         ));
     }
     Ok(())
+}
+
+/// Removes a directory tree (best effort) when dropped. Ensures the PIN
+/// credentials dir is scrubbed on every return path from [`enroll_tpm2_pin`],
+/// including early errors.
+struct ScrubGuard(PathBuf);
+
+impl Drop for ScrubGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Set the Unix mode of `path` to `mode`. Small helper so the PIN-credential
@@ -1716,6 +1754,7 @@ mod tests {
                 "--unlock-tpm2-device=auto",
                 "--tpm2-device=auto",
                 "--tpm2-with-pin=yes",
+                "--tpm2-public-key=/usr/lib/systemd/tpm2-pcr-public-key.pem",
                 "--tpm2-public-key-pcrs=11",
                 "--wipe-slot=tpm2",
                 "/dev/sdb4",

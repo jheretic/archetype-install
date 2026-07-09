@@ -39,12 +39,21 @@ fn main() -> Result<()> {
             }
         }
         Exit::Shell => {
-            // The UI promises a recovery console (esp. after a failed/incomplete
-            // install); deliver one by exec'ing an interactive login shell so the
-            // operator isn't dropped back to whatever started us (the install
-            // service would otherwise just exit).
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-            let err = Command::new(&shell).arg("-l").exec();
+            // The UI promises a recovery/exit console; deliver one by exec'ing an
+            // interactive login shell so the operator isn't dropped back to
+            // whatever started us (the install service would otherwise just exit).
+            //
+            // Force fish rather than $SHELL: the installer runs under kmscon
+            // --login (SHELL is unreliable/unset there), and fish carries the
+            // Archetype custom prompt. Fall back to bash only if fish is somehow
+            // absent, so a broken image still yields *a* shell.
+            const FISH: &str = "/usr/bin/fish";
+            let shell = if std::path::Path::new(FISH).exists() {
+                FISH
+            } else {
+                "/bin/bash"
+            };
+            let err = Command::new(shell).arg("-l").exec();
             // exec only returns on failure.
             eprintln!("failed to start a recovery shell ({shell}): {err}");
         }

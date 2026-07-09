@@ -202,7 +202,18 @@ impl App {
 
     fn apply(&mut self, transition: Transition) {
         match transition {
-            Transition::Quit => self.running = false,
+            Transition::Quit => {
+                // Quitting a REAL install (e.g. `q` on the welcome/preflight/etc.
+                // screens) drops to a shell rather than just exiting: the install
+                // service has nothing to fall back to, so a bare exit would leave
+                // a blank console. Only promote the default Exit::Quit -- screens
+                // that chose Reboot/Shell explicitly (Result) keep their choice.
+                // Dry-run keeps the plain exit (no shell) so it stays a no-op.
+                if !self.dry_run && self.exit == Exit::Quit {
+                    self.exit = Exit::Shell;
+                }
+                self.running = false;
+            }
             Transition::Back => self.go_back(),
             Transition::Next => self.go_next(),
             Transition::Stay => {}
@@ -387,4 +398,35 @@ impl App {
 /// Shared helper: treat `q`/`Esc` as a quit request.
 pub fn is_quit(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quitting_a_real_install_drops_to_shell() {
+        let mut app = App::new(false);
+        app.apply(Transition::Quit);
+        assert!(!app.running);
+        assert_eq!(app.exit, Exit::Shell);
+    }
+
+    #[test]
+    fn quitting_a_dry_run_just_exits() {
+        let mut app = App::new(true);
+        app.apply(Transition::Quit);
+        assert!(!app.running);
+        assert_eq!(app.exit, Exit::Quit);
+    }
+
+    #[test]
+    fn explicit_exit_choice_survives_quit() {
+        // The Result screen sets exit (e.g. Reboot) BEFORE returning Quit; the
+        // promotion must not clobber it.
+        let mut app = App::new(false);
+        app.exit = Exit::Reboot;
+        app.apply(Transition::Quit);
+        assert_eq!(app.exit, Exit::Reboot);
+    }
 }

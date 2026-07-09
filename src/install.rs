@@ -66,6 +66,14 @@ const HOME_KEY_BOOT_PATH: &str = "/etc/integritysetup-keys.d/home.key";
 /// independent of the device node.
 const HOME_PARTLABEL: &str = "HOME";
 
+/// device-mapper name for the encrypted swap volume (`/dev/mapper/<SWAP_VOLUME>`);
+/// also the crypttab volume name and the fstab swap source.
+const SWAP_VOLUME: &str = "cryptswap";
+
+/// GPT partition label of the swap partition (`Label=SWAP` by repart). crypttab
+/// targets `PARTLABEL=SWAP` so the volume is found independent of the device node.
+const SWAP_PARTLABEL: &str = "SWAP";
+
 /// A message from the install worker to the Progress screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Progress {
@@ -281,6 +289,7 @@ fn post_steps(plan: &InstallPlan, tx: &Sender<Progress>) -> Result<(), String> {
     let rest = apply_firstboot(&plan.firstboot, root_mount, tx)
         .and_then(|()| write_machine_info(&plan.firstboot, root_mount, tx))
         .and_then(|()| integrity_home(plan, &parts, root_mount, tx))
+        .and_then(|()| setup_swap(&parts, root_mount, tx))
         .and_then(|()| populate_esp(&parts, tx))
         .and_then(|()| {
             let root = parts
@@ -556,6 +565,44 @@ fn integritysetup_open_args(
 /// mode and discards. Newline-terminated. Fields are whitespace-delimited.
 fn integritytab_line() -> String {
     format!("{HOME_VOLUME}\tPARTLABEL={HOME_PARTLABEL}\t{HOME_KEY_BOOT_PATH}\tallow-discards,mode=bitmap\n")
+}
+
+/// The `/etc/crypttab` line for encrypted swap: open PARTLABEL=SWAP in plain
+/// dm-crypt with a random key from /dev/urandom, and (via the `swap` option)
+/// mkswap the resulting mapper fresh every boot. crypttab(5): the `swap` option
+/// implies plain mode and reformats the device each boot -- so the swap key is
+/// ephemeral and never stored. Newline-terminated.
+fn swap_crypttab_line() -> String {
+    format!("{SWAP_VOLUME}\tPARTLABEL={SWAP_PARTLABEL}\t/dev/urandom\tswap\n")
+}
+
+/// The `/etc/fstab` line activating the decrypted swap mapper. Its presence with
+/// fstype `swap` also disables systemd-gpt-auto-generator's swap auto-activation
+/// (systemd #6192), so the raw partition is never swapped on unencrypted.
+/// `x-systemd.requires` orders it after the crypttab mapper is created.
+fn swap_fstab_line() -> String {
+    format!(
+        "/dev/mapper/{SWAP_VOLUME}\tnone\tswap\tdefaults,x-systemd.requires=/dev/mapper/{SWAP_VOLUME}\t0\t0\n"
+    )
+}
+
+/// Record the encrypted-swap crypttab + fstab entries on the target, when a SWAP
+/// partition exists. No install-time formatting is needed: crypttab's `swap`
+/// option opens + mkswaps the mapper with a fresh random key on every boot. A
+/// no-op when there is no swap partition (the user disabled swap).
+fn setup_swap(
+    parts: &TargetPartitions,
+    root_mount: &Path,
+    tx: &Sender<Progress>,
+) -> Result<(), String> {
+    let Some(swap) = parts.swap.as_ref() else {
+        return Ok(());
+    };
+    let _ = tx.send(Progress::Step("Configuring encrypted swap".to_string()));
+    log(tx, &format!("swap partition: {swap}"));
+    append_line(&root_mount.join("etc/crypttab"), &swap_crypttab_line())?;
+    append_line(&root_mount.join("etc/fstab"), &swap_fstab_line())?;
+    Ok(())
 }
 
 /// The `/etc/fstab` line that mounts the home integrity mapper at `/home`. The
@@ -1419,6 +1466,7 @@ struct TargetPartitions {
     usr: Option<String>,
     usr_verity: Option<String>,
     home: Option<String>,
+    swap: Option<String>,
 }
 
 /// Enumerate `device`'s partitions and classify them by GPT type. Returns an
@@ -1481,6 +1529,7 @@ fn classify(node: &LsblkNode, parts: &mut TargetPartitions) {
             }
             k if k.starts_with("Linux /usr") && !k.contains("verity") => &mut parts.usr,
             "Linux home" => &mut parts.home,
+            "Linux swap" => &mut parts.swap,
             _ => return walk_children(node, parts),
         };
         if slot.is_none() {
@@ -1736,6 +1785,54 @@ mod tests {
             esp_fstab_line(),
             "PARTLABEL=archetype-esp\t/efi\tvfat\tumask=0077,nofail,x-systemd.automount\t0\t2\n"
         );
+    }
+
+    #[test]
+    fn swap_crypttab_line_uses_urandom_and_swap_option() {
+        assert_eq!(
+            swap_crypttab_line(),
+            "cryptswap\tPARTLABEL=SWAP\t/dev/urandom\tswap\n"
+        );
+    }
+
+    #[test]
+    fn swap_fstab_line_activates_the_mapper() {
+        assert_eq!(
+            swap_fstab_line(),
+            "/dev/mapper/cryptswap\tnone\tswap\tdefaults,x-systemd.requires=/dev/mapper/cryptswap\t0\t0\n"
+        );
+    }
+
+    #[test]
+    fn setup_swap_is_noop_without_a_swap_partition() {
+        let dir = std::env::temp_dir().join(format!("archetype-swap-none-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        let parts = TargetPartitions::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        setup_swap(&parts, &dir, &tx).unwrap();
+        assert!(!dir.join("etc/crypttab").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setup_swap_writes_crypttab_and_fstab_when_present() {
+        let dir = std::env::temp_dir().join(format!("archetype-swap-yes-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        let parts = TargetPartitions {
+            swap: Some("/dev/sdb5".to_string()),
+            ..TargetPartitions::default()
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        setup_swap(&parts, &dir, &tx).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("etc/crypttab")).unwrap(),
+            swap_crypttab_line()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("etc/fstab")).unwrap(),
+            swap_fstab_line()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

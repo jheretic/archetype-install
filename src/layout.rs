@@ -206,10 +206,22 @@ pub fn plan(sizing: &Sizing, disk_bytes: u64) -> Result<ConfigurablePartitions, 
             },
             sizing.root,
         ),
+        // Format=empty + Label=SWAP: the swap partition is an ENCRYPTED,
+        // random-key swap. The installer writes an /etc/crypttab line
+        // (PARTLABEL=SWAP, key /dev/urandom, `swap` option) so the installed
+        // system opens it in plain dm-crypt and mkswaps the mapper fresh every
+        // boot, plus an /etc/fstab `swap` line for the mapper. We deliberately
+        // do NOT pre-format it as swap (Format=empty) so no plaintext swap
+        // signature is written at install; and the fstab `swap` entry disables
+        // gpt-auto's swap auto-activation (systemd #6192), so the raw partition
+        // is never auto-swapped on unencrypted. Needs the stable SWAP label for
+        // crypttab's PARTLABEL= to find it (repart would otherwise label it
+        // "swap", which we could match, but an explicit label mirrors HOME).
         swap: sizing.swap.map(|choice| {
             build(
                 PartitionDef {
-                    format: Some(Format::Swap),
+                    label: Some("SWAP".to_string()),
+                    format: Some(Format::Empty),
                     ..PartitionDef::new("swap")
                 },
                 choice,

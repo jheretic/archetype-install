@@ -62,6 +62,14 @@ pub struct FirstbootConfig {
     pub chassis: Chassis,
     /// crypt(3) `$6$` hash of the root password, never the plaintext.
     pub root_password_hash: Option<String>,
+    /// The TPM2 unlock PIN for the encrypted root, if the user chose PIN mode
+    /// (the default). `Some(pin)` -> the installer re-enrolls the root TPM2
+    /// keyslot with `--tpm2-with-pin=yes` + a signed PCR-11 policy and wipes the
+    /// PIN-less slot, so the root only auto-unlocks with the PIN (defends against
+    /// booting live media to decrypt the disk). `None` -> automatic mode: the
+    /// PIN-less TPM2 slot repart enrolled is kept as-is (current behaviour).
+    /// Plaintext, held only until enrollment; never written to disk or logs.
+    pub tpm_pin: Option<String>,
 }
 
 impl Default for FirstbootConfig {
@@ -73,6 +81,7 @@ impl Default for FirstbootConfig {
             hostname: "archetype".to_string(),
             chassis: Chassis::Desktop,
             root_password_hash: None,
+            tpm_pin: None,
         }
     }
 }
@@ -220,6 +229,7 @@ mod tests {
             hostname: "archetype".to_string(),
             chassis: Chassis::Desktop,
             root_password_hash: Some("$6$salt$hash".to_string()),
+            tpm_pin: None,
         };
         let args = config.firstboot_args(Path::new("/run/archetype-install/target"));
         assert_eq!(
@@ -247,6 +257,7 @@ mod tests {
             hostname: String::new(),
             chassis: Chassis::Server,
             root_password_hash: None,
+            tpm_pin: None,
         };
         let args = config.firstboot_args(Path::new("/mnt"));
         assert_eq!(

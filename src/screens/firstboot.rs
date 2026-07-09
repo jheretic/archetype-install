@@ -22,7 +22,8 @@ use crate::app::{App, Transition};
 use crate::firstboot;
 use crate::theme;
 
-/// The selectable fields, in display order.
+/// The selectable fields, in display order. The two PIN fields are only
+/// reachable/gated in PIN mode (see [`visible_fields`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
     Keymap,
@@ -32,9 +33,14 @@ enum Field {
     Chassis,
     Password,
     PasswordConfirm,
+    TpmMode,
+    TpmPin,
+    TpmPinConfirm,
 }
 
-const FIELDS: [Field; 7] = [
+/// All fields in display order. The PIN entry/confirm are dropped from the
+/// navigable set in automatic mode (see [`visible_fields`]).
+const ALL_FIELDS: [Field; 10] = [
     Field::Keymap,
     Field::Locale,
     Field::Timezone,
@@ -42,10 +48,26 @@ const FIELDS: [Field; 7] = [
     Field::Chassis,
     Field::Password,
     Field::PasswordConfirm,
+    Field::TpmMode,
+    Field::TpmPin,
+    Field::TpmPinConfirm,
 ];
 
+/// The fields the cursor can land on given the current TPM mode: in automatic
+/// mode the two PIN fields are hidden (no PIN to collect).
+fn visible_fields(app: &App) -> Vec<Field> {
+    ALL_FIELDS
+        .iter()
+        .copied()
+        .filter(|f| app.tpm_pin_mode || !matches!(f, Field::TpmPin | Field::TpmPinConfirm))
+        .collect()
+}
+
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
-    let field = FIELDS[app.firstboot_cursor];
+    let fields = visible_fields(app);
+    // Clamp the cursor: toggling out of PIN mode can shrink the visible set.
+    app.firstboot_cursor = app.firstboot_cursor.min(fields.len() - 1);
+    let field = fields[app.firstboot_cursor];
     match key.code {
         KeyCode::Esc => Transition::Back,
         KeyCode::Up => {
@@ -53,7 +75,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
             Transition::Stay
         }
         KeyCode::Down => {
-            app.firstboot_cursor = (app.firstboot_cursor + 1).min(FIELDS.len() - 1);
+            app.firstboot_cursor = (app.firstboot_cursor + 1).min(fields.len() - 1);
             Transition::Stay
         }
         KeyCode::Left if field == Field::Chassis => {
@@ -62,6 +84,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
         }
         KeyCode::Right if field == Field::Chassis => {
             app.config.firstboot.chassis = app.config.firstboot.chassis.next();
+            Transition::Stay
+        }
+        // TPM mode is a two-way toggle (PIN <-> automatic).
+        KeyCode::Left | KeyCode::Right if field == Field::TpmMode => {
+            app.tpm_pin_mode = !app.tpm_pin_mode;
             Transition::Stay
         }
         KeyCode::Backspace => {
@@ -82,8 +109,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
     }
 }
 
-/// The editable text buffer for a field, or `None` for the chassis field (which
-/// is cycled, not typed).
+/// The editable text buffer for a field, or `None` for the cycled/toggled
+/// fields (chassis, TPM mode) which take no typed input.
 fn field_buffer(app: &mut App, field: Field) -> Option<&mut String> {
     Some(match field {
         Field::Keymap => &mut app.config.firstboot.keymap,
@@ -92,7 +119,9 @@ fn field_buffer(app: &mut App, field: Field) -> Option<&mut String> {
         Field::Hostname => &mut app.config.firstboot.hostname,
         Field::Password => &mut app.password,
         Field::PasswordConfirm => &mut app.password_confirm,
-        Field::Chassis => return None,
+        Field::TpmPin => &mut app.tpm_pin,
+        Field::TpmPinConfirm => &mut app.tpm_pin_confirm,
+        Field::Chassis | Field::TpmMode => return None,
     })
 }
 
@@ -101,19 +130,34 @@ fn passwords_match(app: &App) -> bool {
     !app.password.is_empty() && app.password == app.password_confirm
 }
 
-/// Whether the screen may advance: all text fields valid and passwords matched.
-fn can_advance(app: &App) -> bool {
-    app.config.firstboot.fields_complete() && passwords_match(app)
+/// Whether the TPM PIN entries are acceptable: in automatic mode there is no PIN
+/// to check; in PIN mode the two entries must be non-empty and equal.
+fn tpm_pin_ok(app: &App) -> bool {
+    !app.tpm_pin_mode || (!app.tpm_pin.is_empty() && app.tpm_pin == app.tpm_pin_confirm)
 }
 
-/// Hash the confirmed password into the config and clear the plaintext buffers.
-/// Only called once [`can_advance`] holds.
+/// Whether the screen may advance: all text fields valid, passwords matched,
+/// and (in PIN mode) the PIN confirmed.
+fn can_advance(app: &App) -> bool {
+    app.config.firstboot.fields_complete() && passwords_match(app) && tpm_pin_ok(app)
+}
+
+/// Hash the confirmed password into the config, move the PIN (PIN mode only)
+/// into the config, and clear all plaintext buffers. Only called once
+/// [`can_advance`] holds.
 fn commit(app: &mut App) {
     if let Ok(hash) = firstboot::hash_root_password(&app.password) {
         app.config.firstboot.root_password_hash = Some(hash);
     }
+    app.config.firstboot.tpm_pin = if app.tpm_pin_mode {
+        Some(app.tpm_pin.clone())
+    } else {
+        None
+    };
     app.password.clear();
     app.password_confirm.clear();
+    app.tpm_pin.clear();
+    app.tpm_pin_confirm.clear();
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -133,20 +177,26 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let inner = frame_block.inner(area);
     frame.render_widget(frame_block, area);
 
+    // PIN mode shows two extra rows (PIN + confirm); automatic mode shows a
+    // one-line warning instead. Keep the layout height stable either way.
+    let pin_rows = if app.tpm_pin_mode { 2 } else { 1 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(1), // keymap
-            Constraint::Length(1), // locale
-            Constraint::Length(1), // timezone
-            Constraint::Length(1), // hostname
-            Constraint::Length(1), // chassis
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // password
-            Constraint::Length(1), // password confirm
-            Constraint::Min(1),    // status
-            Constraint::Length(1), // hint
+            Constraint::Length(1),        // keymap
+            Constraint::Length(1),        // locale
+            Constraint::Length(1),        // timezone
+            Constraint::Length(1),        // hostname
+            Constraint::Length(1),        // chassis
+            Constraint::Length(1),        // spacer
+            Constraint::Length(1),        // password
+            Constraint::Length(1),        // password confirm
+            Constraint::Length(1),        // spacer
+            Constraint::Length(1),        // tpm mode
+            Constraint::Length(pin_rows), // pin+confirm (PIN) or warning (auto)
+            Constraint::Min(1),           // status
+            Constraint::Length(1),        // hint
         ])
         .split(inner);
 
@@ -181,14 +231,39 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ),
         rows[7],
     );
-    frame.render_widget(Paragraph::new(status(app)), rows[8]);
-    frame.render_widget(Paragraph::new(hint()).alignment(Alignment::Center), rows[9]);
+    frame.render_widget(tpm_mode_field(app), rows[9]);
+    if app.tpm_pin_mode {
+        let pin_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(rows[10]);
+        frame.render_widget(
+            password_field(app, Field::TpmPin, "TPM PIN", &app.tpm_pin),
+            pin_area[0],
+        );
+        frame.render_widget(
+            password_field(
+                app,
+                Field::TpmPinConfirm,
+                "confirm PIN",
+                &app.tpm_pin_confirm,
+            ),
+            pin_area[1],
+        );
+    } else {
+        frame.render_widget(tpm_auto_warning(), rows[10]);
+    }
+    frame.render_widget(Paragraph::new(status(app)), rows[11]);
+    frame.render_widget(
+        Paragraph::new(hint()).alignment(Alignment::Center),
+        rows[12],
+    );
 }
 
 /// A selectable text row: caret, label, typed value, and a cursor block on the
 /// active field.
 fn text_field(app: &App, field: Field, label: &str, value: &str) -> Paragraph<'static> {
-    let selected = FIELDS[app.firstboot_cursor] == field;
+    let selected = is_selected(app, field);
     let mut spans = label_spans(label, selected);
     spans.push(Span::styled(
         value.to_string(),
@@ -205,7 +280,7 @@ fn text_field(app: &App, field: Field, label: &str, value: &str) -> Paragraph<'s
 
 /// A masked password row: the value renders as dots.
 fn password_field(app: &App, field: Field, label: &str, value: &str) -> Paragraph<'static> {
-    let selected = FIELDS[app.firstboot_cursor] == field;
+    let selected = is_selected(app, field);
     let mut spans = label_spans(label, selected);
     spans.push(Span::styled(
         "\u{2022}".repeat(value.chars().count()),
@@ -222,7 +297,7 @@ fn password_field(app: &App, field: Field, label: &str, value: &str) -> Paragrap
 
 /// The chassis row: a left/right-cycled choice within {desktop, laptop, server}.
 fn chassis_field(app: &App) -> Paragraph<'static> {
-    let selected = FIELDS[app.firstboot_cursor] == Field::Chassis;
+    let selected = is_selected(app, Field::Chassis);
     let mut spans = label_spans("chassis", selected);
     spans.push(Span::styled(
         format!(
@@ -232,6 +307,43 @@ fn chassis_field(app: &App) -> Paragraph<'static> {
         Style::default().fg(theme::CYAN),
     ));
     Paragraph::new(Line::from(spans))
+}
+
+/// The TPM-mode row: a left/right toggle between PIN (default) and automatic.
+fn tpm_mode_field(app: &App) -> Paragraph<'static> {
+    let selected = is_selected(app, Field::TpmMode);
+    let mut spans = label_spans("disk unlock", selected);
+    let mode = if app.tpm_pin_mode {
+        "TPM + PIN"
+    } else {
+        "TPM automatic (no PIN)"
+    };
+    spans.push(Span::styled(
+        format!("\u{2039} {mode} \u{203a}"),
+        Style::default().fg(theme::CYAN),
+    ));
+    Paragraph::new(Line::from(spans))
+}
+
+/// The warning shown in automatic mode: without a PIN, any bootable live medium
+/// on this machine can TPM-unlock the root, so physical boot access must be
+/// locked down.
+fn tpm_auto_warning() -> Paragraph<'static> {
+    Paragraph::new(Line::from(Span::styled(
+        "  warning: without a PIN, secure only if firmware boot order permits \
+         ONLY the internal drive (no removable media) and a firmware password \
+         prevents changing it -- else a live system can decrypt the root.",
+        Style::default().fg(theme::YELLOW),
+    )))
+    .alignment(Alignment::Left)
+}
+
+/// Whether `field` is the one the cursor is currently on, accounting for the
+/// mode-dependent visible set.
+fn is_selected(app: &App, field: Field) -> bool {
+    let fields = visible_fields(app);
+    let cursor = app.firstboot_cursor.min(fields.len() - 1);
+    fields[cursor] == field
 }
 
 /// The caret + fixed-width label shared by every row.
@@ -262,6 +374,13 @@ fn status(app: &App) -> Line<'static> {
         ("set a root password", theme::YELLOW)
     } else if app.password != app.password_confirm {
         ("passwords do not match", theme::RED)
+    } else if app.tpm_pin_mode && app.tpm_pin.is_empty() {
+        (
+            "set a TPM unlock PIN (or switch disk unlock to automatic)",
+            theme::YELLOW,
+        )
+    } else if app.tpm_pin_mode && app.tpm_pin != app.tpm_pin_confirm {
+        ("TPM PINs do not match", theme::RED)
     } else {
         ("configuration complete", theme::GREEN)
     };
@@ -301,6 +420,9 @@ mod tests {
         let mut app = App::new(true);
         app.password = "hunter2hunter2".to_string();
         app.password_confirm = "hunter2hunter2".to_string();
+        // Default mode is PIN, so a matching PIN is required to advance.
+        app.tpm_pin = "12345678".to_string();
+        app.tpm_pin_confirm = "12345678".to_string();
         app
     }
 
@@ -308,6 +430,38 @@ mod tests {
     fn defaults_plus_matching_passwords_can_advance() {
         let app = typed_app();
         assert!(can_advance(&app));
+    }
+
+    #[test]
+    fn pin_mode_requires_matching_pin() {
+        let mut app = typed_app();
+        app.tpm_pin_confirm = "87654321".to_string();
+        assert!(!can_advance(&app));
+        app.tpm_pin.clear();
+        app.tpm_pin_confirm.clear();
+        assert!(!can_advance(&app)); // empty PIN in PIN mode blocks
+    }
+
+    #[test]
+    fn automatic_mode_needs_no_pin() {
+        let mut app = typed_app();
+        app.tpm_pin_mode = false;
+        app.tpm_pin.clear();
+        app.tpm_pin_confirm.clear();
+        assert!(can_advance(&app));
+    }
+
+    #[test]
+    fn commit_pin_mode_stores_pin_automatic_clears_it() {
+        let mut app = typed_app();
+        commit(&mut app);
+        assert_eq!(app.config.firstboot.tpm_pin.as_deref(), Some("12345678"));
+        assert!(app.tpm_pin.is_empty() && app.tpm_pin_confirm.is_empty());
+
+        let mut auto = typed_app();
+        auto.tpm_pin_mode = false;
+        commit(&mut auto);
+        assert_eq!(auto.config.firstboot.tpm_pin, None);
     }
 
     #[test]

@@ -104,6 +104,14 @@ pub struct App {
     /// Masked root password entry; never persisted. Cleared after hashing.
     pub password: String,
     pub password_confirm: String,
+    /// TPM2 unlock mode: true = PIN (default, hardened), false = automatic
+    /// (no PIN; relies on firmware boot-order + password, see the firstboot
+    /// screen warning). Determines whether the PIN fields below are collected.
+    pub tpm_pin_mode: bool,
+    /// Masked TPM2 PIN entry; never persisted. Moved into the config on commit
+    /// (PIN mode only) and cleared.
+    pub tpm_pin: String,
+    pub tpm_pin_confirm: String,
     pub review: Option<ReviewState>,
     /// The startup TPM2 preflight verdict, read by the Preflight screen.
     pub preflight: Option<PreflightResult>,
@@ -135,6 +143,9 @@ impl App {
             firstboot_cursor: 0,
             password: String::new(),
             password_confirm: String::new(),
+            tpm_pin_mode: true,
+            tpm_pin: String::new(),
+            tpm_pin_confirm: String::new(),
             review: None,
             preflight: Some(preflight),
             running: true,

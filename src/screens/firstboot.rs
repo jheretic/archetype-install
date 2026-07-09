@@ -78,6 +78,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
             app.firstboot_cursor = (app.firstboot_cursor + 1).min(fields.len() - 1);
             Transition::Stay
         }
+        // Tab / Shift-Tab cycle through the fields, WRAPPING (unlike Up/Down,
+        // which clamp at the ends) -- the conventional form-navigation feel.
+        KeyCode::Tab => {
+            app.firstboot_cursor = (app.firstboot_cursor + 1) % fields.len();
+            Transition::Stay
+        }
+        KeyCode::BackTab => {
+            app.firstboot_cursor = (app.firstboot_cursor + fields.len() - 1) % fields.len();
+            Transition::Stay
+        }
         KeyCode::Left if field == Field::Chassis => {
             app.config.firstboot.chassis = app.config.firstboot.chassis.prev();
             Transition::Stay
@@ -400,7 +410,7 @@ fn hint() -> Line<'static> {
     let text = |label: &'static str| Span::styled(label, Style::default().fg(theme::FG));
 
     Line::from(vec![
-        key("up/down", theme::BLUE),
+        key("up/down/tab", theme::BLUE),
         text(" field   "),
         key("left/right", theme::BLUE),
         text(" chassis   "),

@@ -29,6 +29,12 @@ pub struct ProgressState {
     pub recovery_key: Option<String>,
 }
 
+/// The braille spinner frames, advanced one per tick.
+const SPINNER: [char; 10] = [
+    '\u{2807}', '\u{280b}', '\u{2819}', '\u{2838}', '\u{2830}', '\u{2834}', '\u{2826}', '\u{2827}',
+    '\u{2807}', '\u{280f}',
+];
+
 /// Progress ignores input; it advances only when the worker finishes.
 pub fn handle_key() -> Transition {
     Transition::Stay
@@ -62,9 +68,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .split(inner);
 
     let step = app.progress.step.as_deref().unwrap_or("starting\u{2026}");
+    // Braille spinner cycled by the tick counter (~10 fps) so the user can see
+    // the installer is working even while a single step runs for a long time.
+    // Frozen (static glyph) once a terminal outcome has arrived.
+    let spinner = if app.progress.outcome.is_some() {
+        '\u{25b8}' // ▸ (done: no longer animating)
+    } else {
+        SPINNER[(app.tick_count as usize) % SPINNER.len()]
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!("\u{25b8} {step}"),
+            format!("{spinner} {step}"),
             Style::default()
                 .fg(theme::GREEN)
                 .add_modifier(Modifier::BOLD),

@@ -116,6 +116,8 @@ pub struct App {
     /// The startup TPM2 preflight verdict, read by the Preflight screen.
     pub preflight: Option<PreflightResult>,
     pub running: bool,
+    /// Monotonic tick counter (advances ~10x/sec) driving the Progress spinner.
+    pub tick_count: u64,
     pub confirm_input: String,
     pub progress: ProgressState,
     pub exit: Exit,
@@ -149,6 +151,7 @@ impl App {
             review: None,
             preflight: Some(preflight),
             running: true,
+            tick_count: 0,
             confirm_input: String::new(),
             progress: ProgressState::default(),
             exit: Exit::Quit,
@@ -162,7 +165,13 @@ impl App {
         while self.running {
             terminal.draw(|frame| self.draw(frame))?;
             match events.next()? {
-                AppEvent::Tick => self.on_tick(),
+                AppEvent::Tick => {
+                    // Advance the animation frame (~10 fps at the 100ms tick) so
+                    // the Progress screen's spinner moves, reassuring the user
+                    // the installer is alive during long steps.
+                    self.tick_count = self.tick_count.wrapping_add(1);
+                    self.on_tick();
+                }
                 AppEvent::Key(key) => self.handle_key(key),
             }
         }

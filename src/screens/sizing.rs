@@ -18,11 +18,49 @@ use crate::app::{is_quit, App, Transition};
 use crate::layout::{self, SizeChoice, Sizing};
 use crate::theme;
 
-const GIB: u64 = 1024 * 1024 * 1024;
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+const GIB: u64 = 1024 * MIB;
+const TIB: u64 = 1024 * GIB;
 /// How much one left/right keypress moves the selected size.
 const STEP_BYTES: u64 = GIB;
 /// Smallest swap we keep while it is enabled; below this, `s` disables it.
 const SWAP_MIN_BYTES: u64 = GIB;
+
+/// Parse a human size string into bytes. A bare number defaults to GiB; a
+/// unit suffix (case-insensitive, optional trailing "iB"/"B") overrides:
+/// `k/m/g/t` -> KiB/MiB/GiB/TiB. Accepts a decimal fraction (e.g. "1.5T").
+/// Returns `None` on empty, non-numeric, negative, or unknown-unit input. Pure.
+fn parse_size(input: &str) -> Option<u64> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Split the trailing alphabetic unit from the leading number.
+    let split = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let value: f64 = num.trim().parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    // Normalise the unit: strip an optional "iB"/"B" tail, take the first char.
+    let unit = unit.trim().to_ascii_lowercase();
+    let mult = match unit.chars().next() {
+        None => GIB, // bare number -> GiB
+        Some('k') => KIB,
+        Some('m') => MIB,
+        Some('g') => GIB,
+        Some('t') => TIB,
+        Some('b') if unit == "b" => 1,
+        _ => return None,
+    };
+    // Guard the float->int multiply against overflow/NaN.
+    let bytes = value * mult as f64;
+    if !bytes.is_finite() || bytes < 0.0 || bytes > u64::MAX as f64 {
+        return None;
+    }
+    Some(bytes as u64)
+}
 
 /// The adjustable fields, in display order.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,6 +72,10 @@ enum Field {
 const FIELDS: [Field; 2] = [Field::Root, Field::Swap];
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
+    // While editing an exact value, keys go to the edit buffer, not navigation.
+    if app.sizing_edit.is_some() {
+        return handle_edit_key(app, key);
+    }
     if is_quit(key) {
         return Transition::Quit;
     }
@@ -63,8 +105,80 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
             toggle_home(&mut app.config.sizing);
             Transition::Stay
         }
+        // A digit begins exact-value entry on the selected editable field (root,
+        // or swap when enabled). The typed digit seeds the buffer.
+        KeyCode::Char(c) if c.is_ascii_digit() && editable_selected(app) => {
+            app.sizing_edit = Some(c.to_string());
+            Transition::Stay
+        }
         KeyCode::Enter if is_valid(app) => Transition::Next,
         _ => Transition::Stay,
+    }
+}
+
+/// Whether the selected field accepts an exact value: root always, swap only
+/// when enabled (a disabled swap has nothing to edit).
+fn editable_selected(app: &App) -> bool {
+    match FIELDS[app.sizing_cursor] {
+        Field::Root => true,
+        Field::Swap => app.config.sizing.swap.is_some(),
+    }
+}
+
+/// Key handling while the exact-value edit buffer is active. Digits, one
+/// decimal point, and a unit letter (k/m/g/t/b) are accepted; Backspace edits;
+/// Enter commits the parsed value (invalid input keeps editing); Esc cancels.
+fn handle_edit_key(app: &mut App, key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Esc => {
+            app.sizing_edit = None;
+        }
+        KeyCode::Backspace => {
+            if let Some(buf) = app.sizing_edit.as_mut() {
+                buf.pop();
+            }
+        }
+        KeyCode::Enter => {
+            let parsed = app.sizing_edit.as_deref().and_then(parse_size);
+            if let Some(bytes) = parsed {
+                set_selected(app, bytes);
+                app.sizing_edit = None;
+            }
+            // Unparseable -> stay in edit mode so the user can fix it.
+        }
+        KeyCode::Char(c)
+            if c.is_ascii_digit()
+                || c == '.'
+                || matches!(c.to_ascii_lowercase(), 'k' | 'm' | 'g' | 't' | 'b' | 'i') =>
+        {
+            if let Some(buf) = app.sizing_edit.as_mut() {
+                buf.push(c);
+            }
+        }
+        _ => {}
+    }
+    Transition::Stay
+}
+
+/// Set the selected field to an exact byte value, clamped to its floor and the
+/// free space left for the other committed partitions (same bounds as [`adjust`]).
+fn set_selected(app: &mut App, bytes: u64) {
+    let available = available_bytes(app);
+    let sizing = &mut app.config.sizing;
+    let field = FIELDS[app.sizing_cursor];
+    let (floor, current) = match field {
+        Field::Root => (layout::ROOT_MIN_BYTES, choice_bytes(sizing.root)),
+        Field::Swap => match sizing.swap {
+            Some(choice) => (SWAP_MIN_BYTES, choice_bytes(choice)),
+            None => return,
+        },
+    };
+    let others = committed_bytes(sizing) - current;
+    let ceiling = available.saturating_sub(others);
+    let next = bytes.clamp(floor, ceiling.max(floor));
+    match field {
+        Field::Root => sizing.root = SizeChoice::Fixed(next),
+        Field::Swap => sizing.swap = Some(SizeChoice::Fixed(next)),
     }
 }
 
@@ -194,28 +308,40 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_gauge(frame, rows[4], committed, available);
     draw_status(frame, rows[5], app, available);
 
+    let hint_line = if app.sizing_edit.is_some() {
+        edit_hint()
+    } else {
+        hint(sizing.swap.is_some(), sizing.home.is_some())
+    };
     frame.render_widget(
-        Paragraph::new(hint(sizing.swap.is_some(), sizing.home.is_some()))
-            .alignment(Alignment::Center),
+        Paragraph::new(hint_line).alignment(Alignment::Center),
         rows[6],
     );
 }
 
 fn draw_field(frame: &mut Frame, area: Rect, label: &str, app: &App, field: Field, bytes: u64) {
     let selected = FIELDS[app.sizing_cursor] == field;
-    frame.render_widget(
-        Paragraph::new(field_line(label, &human_bytes(bytes), selected)),
-        area,
-    );
+    let value = editing_value(app, field).unwrap_or_else(|| human_bytes(bytes));
+    frame.render_widget(Paragraph::new(field_line(label, &value, selected)), area);
 }
 
 fn draw_swap(frame: &mut Frame, area: Rect, app: &App) {
     let selected = FIELDS[app.sizing_cursor] == Field::Swap;
-    let value = match app.config.sizing.swap {
+    let value = editing_value(app, Field::Swap).unwrap_or_else(|| match app.config.sizing.swap {
         Some(choice) => human_bytes(choice_bytes(choice)),
         None => "disabled".to_string(),
-    };
+    });
     frame.render_widget(Paragraph::new(field_line("swap", &value, selected)), area);
+}
+
+/// When `field` is the one currently being edited, the buffer text plus a block
+/// cursor (so the row shows live typing); otherwise `None`.
+fn editing_value(app: &App, field: Field) -> Option<String> {
+    if FIELDS[app.sizing_cursor] == field {
+        app.sizing_edit.as_ref().map(|buf| format!("{buf}\u{2588}"))
+    } else {
+        None
+    }
 }
 
 fn draw_home(frame: &mut Frame, area: Rect, app: &App, remaining: u64) {
@@ -311,6 +437,24 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, available: u64) {
     frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
 }
 
+/// The hint shown while typing an exact value.
+fn edit_hint() -> Line<'static> {
+    let key = |label: &'static str, color| {
+        Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )
+    };
+    let text = |label: &'static str| Span::styled(label, Style::default().fg(theme::FG));
+    Line::from(vec![
+        text("type a size (e.g. 40G, 512M, 1.5T)   "),
+        key("Enter", theme::GREEN),
+        text(" set   "),
+        key("Esc", theme::RED),
+        text(" cancel"),
+    ])
+}
+
 fn hint(swap_enabled: bool, home_enabled: bool) -> Line<'static> {
     let key = |label: &'static str, color| {
         Span::styled(
@@ -325,6 +469,8 @@ fn hint(swap_enabled: bool, home_enabled: bool) -> Line<'static> {
         text(" field   "),
         key("left/right", theme::BLUE),
         text(" size   "),
+        key("0-9", theme::BLUE),
+        text(" type exact   "),
         key("s", theme::YELLOW),
         text(if swap_enabled {
             " swap off   "
@@ -445,5 +591,51 @@ mod tests {
         toggle_home(&mut app.config.sizing);
         assert!(app.config.sizing.home.is_none());
         assert!(is_valid(&app));
+    }
+
+    #[test]
+    fn parse_size_bare_number_defaults_to_gib() {
+        assert_eq!(parse_size("40"), Some(40 * GIB));
+        assert_eq!(parse_size("  8 "), Some(8 * GIB));
+    }
+
+    #[test]
+    fn parse_size_accepts_unit_suffixes_case_insensitive() {
+        assert_eq!(parse_size("512M"), Some(512 * MIB));
+        assert_eq!(parse_size("512mib"), Some(512 * MIB));
+        assert_eq!(parse_size("2G"), Some(2 * GIB));
+        assert_eq!(parse_size("1T"), Some(TIB));
+        assert_eq!(parse_size("1024k"), Some(1024 * KIB));
+        assert_eq!(parse_size("1048576b"), Some(MIB));
+    }
+
+    #[test]
+    fn parse_size_accepts_decimal_fraction() {
+        assert_eq!(parse_size("1.5T"), Some(TIB + TIB / 2));
+        assert_eq!(parse_size("0.5G"), Some(GIB / 2));
+    }
+
+    #[test]
+    fn parse_size_rejects_garbage() {
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("abc"), None);
+        assert_eq!(parse_size("-5G"), None);
+        assert_eq!(parse_size("5X"), None);
+        assert_eq!(parse_size("G"), None);
+    }
+
+    #[test]
+    fn set_selected_clamps_to_floor_and_ceiling() {
+        let mut app = app_with_disk(DISK_512G);
+        app.sizing_cursor = 0; // root
+                               // Below floor -> floored.
+        set_selected(&mut app, 1);
+        assert_eq!(choice_bytes(app.config.sizing.root), layout::ROOT_MIN_BYTES);
+        // Absurdly large -> clamped within free space, still valid.
+        set_selected(&mut app, 10_000 * GIB);
+        assert!(is_valid(&app));
+        // A sane exact value lands verbatim.
+        set_selected(&mut app, 40 * GIB);
+        assert_eq!(choice_bytes(app.config.sizing.root), 40 * GIB);
     }
 }

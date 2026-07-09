@@ -100,6 +100,10 @@ pub struct App {
     pub disks: Vec<Disk>,
     pub disk_cursor: usize,
     pub sizing_cursor: usize,
+    /// Exact-value edit buffer for the selected sizing field. `Some(text)` while
+    /// the user is typing a size (e.g. "40G"); `None` when not editing. The
+    /// sizing screen renders the buffer with a cursor and commits it on Enter.
+    pub sizing_edit: Option<String>,
     pub firstboot_cursor: usize,
     /// Masked root password entry; never persisted. Cleared after hashing.
     pub password: String,
@@ -142,6 +146,7 @@ impl App {
             disks: Vec::new(),
             disk_cursor: 0,
             sizing_cursor: 0,
+            sizing_edit: None,
             firstboot_cursor: 0,
             password: String::new(),
             password_confirm: String::new(),

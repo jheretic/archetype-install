@@ -106,8 +106,14 @@ validation, root-lock arg, credential file contents).
   + write `/etc/credstore/home.create.<user>`. Keep root-partition recovery +
   TPM-PIN steps unchanged.
 - **Phase 4 — image (archetype-build):** add `sudo` to Packages=; ship the wheel
-  sudoers dropin; VERIFY systemd-homed.service is enabled in the built image
-  (preset applied, not masked) so first boot consumes the credential. ALSO
+  sudoers dropin; GUARANTEE systemd-homed is enabled in the built image.
+  IMPLEMENTED: mkosi does NOT apply the systemd preset, so postinst
+  `enable_homed()` creates EXPLICIT real /usr .wants symlinks
+  (multi-user.target.wants/systemd-homed.service + ...activate, then
+  systemd-homed.service.wants/systemd-homed-firstboot.service, then
+  systemd-homed-firstboot.service.wants/archetype-credstore-cleanup.service).
+  Missing homed.service or homed-firstboot.service is FATAL (fails the build) —
+  the anti-lockout guarantee can't be best-effort. ALSO
   (deferred from the Phase 2/3 review, major #5): `ImportCredential=` COPIES the
   credential — PID1/homectl do NOT unlink the `/etc/credstore/home.create.<user>`
   source, so the plaintext password lingers on the (encrypted, 0600) root after
@@ -130,5 +136,6 @@ validation, root-lock arg, credential file contents).
   verification that homed is enabled in the BUILT image + the recovery console.
   This matches image-based-distro norms; a fallback getty / staged-lock adds
   real complexity we're not taking on.
-- **Storage backend** (above) — pick subvolume/directory over nested LUKS.
+- **Storage backend** — DECIDED: nested LUKS (`storage=luks`), see the Storage
+  Backend section above. (Not subvolume/directory.)
 - **VM-only validation** for the whole first-boot/homed path.

@@ -1,11 +1,12 @@
 //! First-boot configuration: the data the wizard collects for a later phase to
-//! feed `systemd-firstboot --root=<target>`, write `/etc/machine-info`, and
-//! stage the systemd-homed first-user credential.
+//! feed `systemd-firstboot --root=<target>` and stage the systemd-homed
+//! first-user credential.
 //!
-//! This module owns the [`FirstbootConfig`] accumulator, the [`Chassis`]
-//! choice, the [`UserConfig`] first-user record, field validation, and
-//! password hashing. A later phase consumes these values; nothing here runs
-//! systemd or touches the target.
+//! This module owns the [`FirstbootConfig`] accumulator, the [`UserConfig`]
+//! first-user record, field validation, and password hashing. A later phase
+//! consumes these values; nothing here runs systemd or touches the target.
+//! The chassis is left to systemd's automatic detection (machine-info(5)), so
+//! the installer neither collects nor writes `CHASSIS=`.
 //!
 //! Identity model: root is LOCKED (no login); the admin path is an initial
 //! systemd-homed user in the `wheel` group. The user password is hashed with
@@ -23,41 +24,6 @@ use sha_crypt::{sha512_simple, Sha512Params, ROUNDS_DEFAULT};
 /// password can produce, so root has no working login. Passed to
 /// `systemd-firstboot --root-password-hashed=` to lock root on the target.
 pub const LOCKED_PASSWORD_HASH: &str = "!*";
-
-/// The machine chassis, mapped to `CHASSIS=` in `/etc/machine-info`. Exactly
-/// these three are offered; the stored value is the lowercase string.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Chassis {
-    Desktop,
-    Laptop,
-    Server,
-}
-
-impl Chassis {
-    /// The three choices, in cycle order.
-    pub const ALL: [Chassis; 3] = [Chassis::Desktop, Chassis::Laptop, Chassis::Server];
-
-    /// The `CHASSIS=` value, e.g. `desktop`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Chassis::Desktop => "desktop",
-            Chassis::Laptop => "laptop",
-            Chassis::Server => "server",
-        }
-    }
-
-    /// Cycle to the next choice, wrapping; stays within [`Chassis::ALL`].
-    pub fn next(self) -> Chassis {
-        let index = Self::ALL.iter().position(|&c| c == self).unwrap_or(0);
-        Self::ALL[(index + 1) % Self::ALL.len()]
-    }
-
-    /// Cycle to the previous choice, wrapping; stays within [`Chassis::ALL`].
-    pub fn prev(self) -> Chassis {
-        let index = Self::ALL.iter().position(|&c| c == self).unwrap_or(0);
-        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
-    }
-}
 
 /// The initial systemd-homed user, collected on the Config screen. Holds both
 /// the crypt(3) `$6$` password hash (for auth) and the plaintext password
@@ -135,7 +101,6 @@ pub struct FirstbootConfig {
     pub locale: String,
     pub timezone: String,
     pub hostname: String,
-    pub chassis: Chassis,
     /// The initial systemd-homed user; `None` until the screen commits it.
     pub user: Option<UserConfig>,
     /// The TPM2 unlock PIN for the encrypted root, if the user chose PIN mode
@@ -155,7 +120,6 @@ impl Default for FirstbootConfig {
             locale: "en_US.UTF-8".to_string(),
             timezone: "UTC".to_string(),
             hostname: "archetype".to_string(),
-            chassis: Chassis::Desktop,
             user: None,
             tpm_pin: None,
         }
@@ -195,13 +159,6 @@ impl FirstbootConfig {
         push("--hostname", &self.hostname);
         args.push(format!("--root-password-hashed={LOCKED_PASSWORD_HASH}"));
         args
-    }
-
-    /// The `/etc/machine-info` contents carrying `CHASSIS=`. Newline-terminated.
-    /// `CHASSIS=` is a machine-info(5) field, not a firstboot flag, so it is
-    /// written as a discrete step.
-    pub fn machine_info(&self) -> String {
-        format!("CHASSIS={}\n", self.chassis.as_str())
     }
 
     /// Whether every required text field is filled and the hostname is valid.
@@ -470,7 +427,6 @@ mod tests {
             locale: "en_US.UTF-8".to_string(),
             timezone: "UTC".to_string(),
             hostname: "archetype".to_string(),
-            chassis: Chassis::Desktop,
             user: Some(sample_user()),
             tpm_pin: None,
         };
@@ -497,7 +453,6 @@ mod tests {
             locale: String::new(),
             timezone: "UTC".to_string(),
             hostname: String::new(),
-            chassis: Chassis::Server,
             user: None,
             tpm_pin: None,
         };
@@ -517,33 +472,8 @@ mod tests {
     }
 
     #[test]
-    fn machine_info_carries_chassis_newline_terminated() {
-        let config = FirstbootConfig {
-            chassis: Chassis::Laptop,
-            ..FirstbootConfig::default()
-        };
-        assert_eq!(config.machine_info(), "CHASSIS=laptop\n");
-    }
-
-    #[test]
     fn firstboot_args_always_lock_root() {
         let args = FirstbootConfig::default().firstboot_args(Path::new("/mnt"));
         assert!(args.contains(&"--root-password-hashed=!*".to_string()));
-    }
-
-    #[test]
-    fn chassis_cycles_within_the_three_choices() {
-        let mut chassis = Chassis::Desktop;
-        let mut seen = Vec::new();
-        for _ in 0..6 {
-            seen.push(chassis.as_str());
-            assert!(Chassis::ALL.contains(&chassis));
-            chassis = chassis.next();
-        }
-        assert_eq!(chassis, Chassis::Desktop, "next must wrap");
-        assert_eq!(Chassis::Desktop.prev(), Chassis::Server, "prev must wrap");
-        assert!(seen
-            .iter()
-            .all(|s| ["desktop", "laptop", "server"].contains(s)));
     }
 }

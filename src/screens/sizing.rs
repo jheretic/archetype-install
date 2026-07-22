@@ -101,10 +101,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
             toggle_swap(&mut app.config.sizing);
             Transition::Stay
         }
-        KeyCode::Char('o') => {
-            toggle_home(&mut app.config.sizing);
-            Transition::Stay
-        }
         // A digit begins exact-value entry on the selected editable field (root,
         // or swap when enabled). The typed digit seeds the buffer.
         KeyCode::Char(c) if c.is_ascii_digit() && editable_selected(app) => {
@@ -239,18 +235,6 @@ fn toggle_swap(sizing: &mut Sizing) {
     };
 }
 
-/// Toggle the home partition. When off, its space is left as free GPT space for
-/// the user to partition later; when restored, it grows to fill the remainder.
-fn toggle_home(sizing: &mut Sizing) {
-    sizing.home = match sizing.home {
-        Some(_) => None,
-        None => Some(SizeChoice::Grow {
-            weight: 1000,
-            min_bytes: 0,
-        }),
-    };
-}
-
 /// Whether the current sizing validates against the chosen disk.
 fn is_valid(app: &App) -> bool {
     app.config
@@ -311,7 +295,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let hint_line = if app.sizing_edit.is_some() {
         edit_hint()
     } else {
-        hint(sizing.swap.is_some(), sizing.home.is_some())
+        hint(sizing.swap.is_some())
     };
     frame.render_widget(
         Paragraph::new(hint_line).alignment(Alignment::Center),
@@ -344,29 +328,18 @@ fn editing_value(app: &App, field: Field) -> Option<String> {
     }
 }
 
-fn draw_home(frame: &mut Frame, area: Rect, app: &App, remaining: u64) {
-    let line = if app.config.sizing.home.is_some() {
-        Line::from(vec![
-            Span::styled("    home  ", Style::default().fg(theme::FG)),
-            Span::styled(
-                format!("{} ", human_bytes(remaining)),
-                Style::default().fg(theme::CYAN),
-            ),
-            Span::styled(
-                "(grows to fill remaining)",
-                Style::default().fg(theme::BRIGHT_BLACK),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("    home  ", Style::default().fg(theme::FG)),
-            Span::styled("disabled ", Style::default().fg(theme::CYAN)),
-            Span::styled(
-                "(remaining left as free space)",
-                Style::default().fg(theme::BRIGHT_BLACK),
-            ),
-        ])
-    };
+fn draw_home(frame: &mut Frame, area: Rect, _app: &App, remaining: u64) {
+    let line = Line::from(vec![
+        Span::styled("    home  ", Style::default().fg(theme::FG)),
+        Span::styled(
+            format!("{} ", human_bytes(remaining)),
+            Style::default().fg(theme::CYAN),
+        ),
+        Span::styled(
+            "(grows to fill remaining)",
+            Style::default().fg(theme::BRIGHT_BLACK),
+        ),
+    ]);
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -455,7 +428,7 @@ fn edit_hint() -> Line<'static> {
     ])
 }
 
-fn hint(swap_enabled: bool, home_enabled: bool) -> Line<'static> {
+fn hint(swap_enabled: bool) -> Line<'static> {
     let key = |label: &'static str, color| {
         Span::styled(
             label,
@@ -476,12 +449,6 @@ fn hint(swap_enabled: bool, home_enabled: bool) -> Line<'static> {
             " swap off   "
         } else {
             " swap on   "
-        }),
-        key("o", theme::YELLOW),
-        text(if home_enabled {
-            " home off   "
-        } else {
-            " home on   "
         }),
         key("Enter", theme::GREEN),
         text(" next   "),
@@ -576,19 +543,12 @@ mod tests {
     }
 
     #[test]
-    fn toggle_home_round_trips() {
-        let mut sizing = Sizing::default();
-        let had_home = sizing.home.is_some();
-        toggle_home(&mut sizing);
-        assert_eq!(sizing.home.is_some(), !had_home);
-        toggle_home(&mut sizing);
-        assert_eq!(sizing.home.is_some(), had_home);
-    }
-
-    #[test]
     fn sizing_is_valid_with_home_omitted() {
+        // The UI no longer offers a home toggle (home is always on), but the
+        // layout must still validate a home-less sizing -- exercise that path
+        // directly so layout::plan's None handling stays covered.
         let mut app = app_with_disk(DISK_512G);
-        toggle_home(&mut app.config.sizing);
+        app.config.sizing.home = None;
         assert!(app.config.sizing.home.is_none());
         assert!(is_valid(&app));
     }

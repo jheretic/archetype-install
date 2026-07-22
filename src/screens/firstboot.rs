@@ -1,8 +1,8 @@
 //! System configuration: collect the first-boot fields (keymap, locale,
-//! timezone, hostname, chassis) and the homed user (username, full name,
+//! timezone, hostname) and the homed user (username, full name,
 //! password).
 //!
-//! A cursor selects one field. Text fields take typed input; the chassis field
+//! A cursor selects one field. Text fields take typed input; the disk-unlock field
 //! cycles left/right within {desktop, laptop, server}; the two password fields
 //! are masked. Advancing is gated on every text field being filled, the
 //! hostname being valid, the username/full name being valid, and the two
@@ -32,7 +32,6 @@ enum Field {
     Locale,
     Timezone,
     Hostname,
-    Chassis,
     Username,
     Realname,
     Password,
@@ -44,12 +43,11 @@ enum Field {
 
 /// All fields in display order. The PIN entry/confirm are dropped from the
 /// navigable set in automatic mode (see [`visible_fields`]).
-const ALL_FIELDS: [Field; 12] = [
+const ALL_FIELDS: [Field; 11] = [
     Field::Keymap,
     Field::Locale,
     Field::Timezone,
     Field::Hostname,
-    Field::Chassis,
     Field::Username,
     Field::Realname,
     Field::Password,
@@ -94,14 +92,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
             app.firstboot_cursor = (app.firstboot_cursor + fields.len() - 1) % fields.len();
             Transition::Stay
         }
-        KeyCode::Left if field == Field::Chassis => {
-            app.config.firstboot.chassis = app.config.firstboot.chassis.prev();
-            Transition::Stay
-        }
-        KeyCode::Right if field == Field::Chassis => {
-            app.config.firstboot.chassis = app.config.firstboot.chassis.next();
-            Transition::Stay
-        }
         // TPM mode is a two-way toggle (PIN <-> automatic).
         KeyCode::Left | KeyCode::Right if field == Field::TpmMode => {
             app.tpm_pin_mode = !app.tpm_pin_mode;
@@ -132,7 +122,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
 }
 
 /// The editable text buffer for a field, or `None` for the cycled/toggled
-/// fields (chassis, TPM mode) which take no typed input.
+/// fields (TPM mode) which take no typed input.
 fn field_buffer(app: &mut App, field: Field) -> Option<&mut String> {
     Some(match field {
         Field::Keymap => &mut app.config.firstboot.keymap,
@@ -145,7 +135,7 @@ fn field_buffer(app: &mut App, field: Field) -> Option<&mut String> {
         Field::PasswordConfirm => &mut app.password_confirm,
         Field::TpmPin => &mut app.tpm_pin,
         Field::TpmPinConfirm => &mut app.tpm_pin_confirm,
-        Field::Chassis | Field::TpmMode => return None,
+        Field::TpmMode => return None,
     })
 }
 
@@ -234,7 +224,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(1),        // locale
             Constraint::Length(1),        // timezone
             Constraint::Length(1),        // hostname
-            Constraint::Length(1),        // chassis
             Constraint::Length(1),        // spacer
             Constraint::Length(1),        // username
             Constraint::Length(1),        // realname
@@ -265,18 +254,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
         text_field(app, Field::Hostname, "hostname", &fb.hostname),
         rows[3],
     );
-    frame.render_widget(chassis_field(app), rows[4]);
     frame.render_widget(
         text_field(app, Field::Username, "username", &app.username),
-        rows[6],
+        rows[5],
     );
     frame.render_widget(
         text_field(app, Field::Realname, "full name", &app.realname),
-        rows[7],
+        rows[6],
     );
     frame.render_widget(
         password_field(app, Field::Password, "password", &app.password),
-        rows[8],
+        rows[7],
     );
     frame.render_widget(
         password_field(
@@ -285,14 +273,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
             "confirm",
             &app.password_confirm,
         ),
-        rows[9],
+        rows[8],
     );
-    frame.render_widget(tpm_mode_field(app), rows[11]);
+    frame.render_widget(tpm_mode_field(app), rows[10]);
     if app.tpm_pin_mode {
         let pin_area = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(rows[12]);
+            .split(rows[11]);
         frame.render_widget(
             password_field(app, Field::TpmPin, "TPM PIN", &app.tpm_pin),
             pin_area[0],
@@ -307,12 +295,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
             pin_area[1],
         );
     } else {
-        frame.render_widget(tpm_auto_warning(), rows[12]);
+        frame.render_widget(tpm_auto_warning(), rows[11]);
     }
-    frame.render_widget(Paragraph::new(status(app)), rows[13]);
+    frame.render_widget(Paragraph::new(status(app)), rows[12]);
     frame.render_widget(
         Paragraph::new(hint()).alignment(Alignment::Center),
-        rows[14],
+        rows[13],
     );
 }
 
@@ -348,20 +336,6 @@ fn password_field(app: &App, field: Field, label: &str, value: &str) -> Paragrap
             Style::default().fg(theme::BRIGHT_BLACK),
         ));
     }
-    Paragraph::new(Line::from(spans))
-}
-
-/// The chassis row: a left/right-cycled choice within {desktop, laptop, server}.
-fn chassis_field(app: &App) -> Paragraph<'static> {
-    let selected = is_selected(app, Field::Chassis);
-    let mut spans = label_spans("chassis", selected);
-    spans.push(Span::styled(
-        format!(
-            "\u{2039} {} \u{203a}",
-            app.config.firstboot.chassis.as_str()
-        ),
-        Style::default().fg(theme::CYAN),
-    ));
     Paragraph::new(Line::from(spans))
 }
 
@@ -469,7 +443,7 @@ fn hint() -> Line<'static> {
         key("up/down/tab", theme::BLUE),
         text(" field   "),
         key("left/right", theme::BLUE),
-        text(" chassis   "),
+        text(" disk unlock   "),
         key("Enter", theme::GREEN),
         text(" next   "),
         key("Esc", theme::RED),

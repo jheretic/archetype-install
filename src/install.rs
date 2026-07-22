@@ -294,7 +294,6 @@ fn post_steps(plan: &InstallPlan, tx: &Sender<Progress>) -> Result<(), String> {
     mount_and_seed(&parts, tx)?;
     let root_mount = Path::new(TARGET_MOUNT);
     let rest = apply_firstboot(&plan.firstboot, root_mount, tx)
-        .and_then(|()| write_machine_info(&plan.firstboot, root_mount, tx))
         .and_then(|()| write_machine_id(root_mount, tx))
         .and_then(|()| stage_user_credential(&plan.firstboot, root_mount, tx))
         .and_then(|()| integrity_home(plan, &parts, root_mount, tx))
@@ -481,21 +480,6 @@ fn apply_firstboot(
     } else {
         Err("systemd-firstboot failed to apply first-boot config to the target".to_string())
     }
-}
-
-/// Write `<target>/etc/machine-info` with `CHASSIS=`. A discrete step: `CHASSIS=`
-/// is a machine-info(5) field, not a firstboot flag. `/etc` exists after the
-/// factory seed but the file itself usually does not, so it is created.
-fn write_machine_info(
-    firstboot: &FirstbootConfig,
-    root_mount: &Path,
-    tx: &Sender<Progress>,
-) -> Result<(), String> {
-    let _ = tx.send(Progress::Step("Writing /etc/machine-info".to_string()));
-    let path = root_mount.join("etc/machine-info");
-    log(tx, &format!("writing {}", path.display()));
-    std::fs::write(&path, firstboot.machine_info())
-        .map_err(|err| format!("could not write {}: {err}", path.display()))
 }
 
 /// The literal systemd writes to `/etc/machine-id` to mark a not-yet-provisioned

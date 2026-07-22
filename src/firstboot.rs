@@ -55,7 +55,13 @@ impl UserConfig {
     pub fn home_create_record(&self) -> String {
         let mut record = json!({
             "userName": self.username,
-            "memberOf": ["wheel"],
+            // wheel -> sudo (admin path, root is locked); users -> the
+            // conventional primary/shared group many desktop bits assume.
+            "memberOf": ["wheel", "users"],
+            // homed users bypass /etc/passwd and /etc/default/useradd, so the
+            // image's fish default never reaches them -- set it in the record
+            // explicitly or the user lands on the built-in bash default.
+            "shell": "/usr/bin/fish",
             "storage": "luks",
             "disposition": "regular",
             // Disable homed's password-quality check at create time: the screen
@@ -322,7 +328,8 @@ mod tests {
         assert_eq!(json["realName"], "Alice Example");
         assert_eq!(json["disposition"], "regular");
         assert_eq!(json["storage"], "luks");
-        assert_eq!(json["memberOf"], serde_json::json!(["wheel"]));
+        assert_eq!(json["memberOf"], serde_json::json!(["wheel", "users"]));
+        assert_eq!(json["shell"], "/usr/bin/fish");
         assert_eq!(json["privileged"]["hashedPassword"][0], "$6$salt$hash");
         assert_eq!(json["secret"]["password"][0], "hunter2hunter2");
     }

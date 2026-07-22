@@ -156,8 +156,15 @@ fn can_advance(app: &App) -> bool {
 /// into the config, and clear all plaintext buffers. Only called once
 /// [`can_advance`] holds.
 fn commit(app: &mut App) {
-    if let Ok(hash) = firstboot::hash_root_password(&app.password) {
-        app.config.firstboot.root_password_hash = Some(hash);
+    // TODO(phase2): collect username + GECOS on the screen. For now build a
+    // placeholder UserConfig from the password buffers so the crate compiles.
+    if let Ok(hash) = firstboot::hash_password(&app.password) {
+        app.config.firstboot.user = Some(firstboot::UserConfig {
+            username: String::new(),
+            realname: String::new(),
+            password_hash: hash,
+            password_plain: app.password.clone(),
+        });
     }
     app.config.firstboot.tpm_pin = if app.tpm_pin_mode {
         Some(app.tpm_pin.clone())
@@ -508,8 +515,8 @@ mod tests {
         let mut app = typed_app();
         assert!(can_advance(&app));
         commit(&mut app);
-        let hash = app.config.firstboot.root_password_hash.as_ref().unwrap();
-        assert!(hash.starts_with("$6$"));
+        let user = app.config.firstboot.user.as_ref().unwrap();
+        assert!(user.password_hash.starts_with("$6$"));
         assert!(app.password.is_empty());
         assert!(app.password_confirm.is_empty());
     }

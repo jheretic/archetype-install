@@ -240,13 +240,9 @@ impl App {
             Screen::Preflight => Screen::Welcome,
             Screen::Welcome => Screen::Config,
             Screen::Config => {
-                // Set the SAME root password on the live system now, so the
-                // operator can actually log in (we dropped systemd-firstboot,
-                // and the live root has no password otherwise). Skipped in
-                // dry-run, which must not mutate the live system.
-                if !self.dry_run {
-                    self.set_live_root_password();
-                }
+                // TODO(phase3): root is now LOCKED and the admin path is the
+                // homed wheel user; there is no live root password to set here.
+                // Phase 3 wires the credstore write in install.rs.
                 self.load_disks();
                 Screen::DiskSelect
             }
@@ -383,29 +379,6 @@ impl App {
     fn load_disks(&mut self) {
         self.disks = enumerate_disks().unwrap_or_default();
         self.disk_cursor = 0;
-    }
-
-    /// Apply the configured root password hash to the LIVE system via
-    /// `chpasswd -e` (the hash is fed on stdin, never argv, so it stays out of
-    /// the process list). Best-effort: a failure is not surfaced -- the install
-    /// still proceeds and the target gets the password via firstboot regardless.
-    fn set_live_root_password(&self) {
-        let Some(entry) = self.config.firstboot.live_root_chpasswd_entry() else {
-            return;
-        };
-        if let Ok(mut child) = std::process::Command::new("chpasswd")
-            .arg("-e")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            use std::io::Write;
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(entry.as_bytes());
-            }
-            let _ = child.wait();
-        }
     }
 }
 

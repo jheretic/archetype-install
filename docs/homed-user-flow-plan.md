@@ -71,10 +71,14 @@ it explicitly for clarity). Do NOT use subvolume/directory.
 
 ## Target flow
 
-1. **Lock root** instead of setting a root password. Offline: set root's shadow
-   entry to a locked hash (`!*`). Verify the cleanest offline mechanism
-   (`systemd-firstboot --root-password-hashed='!*'`, or writing the shadow entry
-   directly). No root login; wheel+sudo is the admin path.
+1. **Lock root** instead of setting a root password. VERIFIED (systemd v261
+   src/firstboot/firstboot.c + user-util.h): `--root-password-hashed=!*` is
+   correct — `!*` IS systemd's own `PASSWORD_LOCKED_AND_INVALID` constant, and
+   `write_root_shadow` writes the value verbatim into `sp_pwdp` (no hash
+   validation). Explicit `!*` is more robust than passing nothing (which only
+   defaults to `!*` when creating a fresh root entry; under `--force` with a
+   factory-seeded /etc/shadow the explicit flag forces it). No root login;
+   wheel+sudo is the admin path.
 2. **Collect on the config screen:** username (valid UNIX name), full name/GECOS,
    password (+ confirm). Drop the root-password field.
 3. **Add `sudo`** to archetype-build Packages= + ship a wheel dropin

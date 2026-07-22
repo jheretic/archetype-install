@@ -1,19 +1,28 @@
 //! First-boot configuration: the data the wizard collects for a later phase to
-//! feed `systemd-firstboot --root=<target>` and to write `/etc/machine-info`.
+//! feed `systemd-firstboot --root=<target>`, write `/etc/machine-info`, and
+//! stage the systemd-homed first-user credential.
 //!
 //! This module owns the [`FirstbootConfig`] accumulator, the [`Chassis`]
-//! choice, field validation, and password hashing. A later phase consumes
-//! these values; nothing here runs systemd or touches the target.
+//! choice, the [`UserConfig`] first-user record, field validation, and
+//! password hashing. A later phase consumes these values; nothing here runs
+//! systemd or touches the target.
 //!
-//! The root password is never stored as plaintext: the screen hashes it with
-//! [`hash_root_password`] into a crypt(3) `$6$` (SHA-512) string, which is what
-//! `systemd-firstboot --root-password-hashed=` expects. No hashing tool is
-//! installed in the image, so we hash in-process.
+//! Identity model: root is LOCKED (no login); the admin path is an initial
+//! systemd-homed user in the `wheel` group. The user password is hashed with
+//! [`hash_password`] into a crypt(3) `$6$` (SHA-512) string for auth, but the
+//! plaintext is also held in [`UserConfig`] because homed needs it at create
+//! time to derive the LUKS home key (see docs/homed-user-flow-plan.md).
 
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
+use serde_json::json;
 use sha_crypt::{sha512_simple, Sha512Params, ROUNDS_DEFAULT};
+
+/// The locked-account shadow/hash convention: an invalid crypt string that no
+/// password can produce, so root has no working login. Passed to
+/// `systemd-firstboot --root-password-hashed=` to lock root on the target.
+pub const LOCKED_PASSWORD_HASH: &str = "!*";
 
 /// The machine chassis, mapped to `CHASSIS=` in `/etc/machine-info`. Exactly
 /// these three are offered; the stored value is the lowercase string.
@@ -50,9 +59,70 @@ impl Chassis {
     }
 }
 
+/// The initial systemd-homed user, collected on the Config screen. Holds both
+/// the crypt(3) `$6$` password hash (for auth) and the plaintext password
+/// (needed by homed at create time to derive the LUKS home key). The plaintext
+/// lives only in-memory here; a later phase writes it into the 0600 credstore
+/// credential on the LUKS-encrypted target.
+#[derive(Clone)]
+pub struct UserConfig {
+    /// UNIX username; validated by [`valid_username`].
+    pub username: String,
+    /// Full name / GECOS; may be empty (then `realName` is omitted).
+    pub realname: String,
+    /// crypt(3) `$6$` SHA-512 hash of the password, for `privileged.hashedPassword`.
+    pub password_hash: String,
+    /// Plaintext password, for the `secret.password` array homed needs at create.
+    pub password_plain: String,
+}
+
+// Consumed by the Phase-2 screen and Phase-3 install wiring; unit-tested now.
+#[allow(dead_code)]
+impl UserConfig {
+    /// The compact JSON systemd user record for the `home.create.<username>`
+    /// credential. Follows the systemd JSON User Records spec: top-level
+    /// identity fields, a `privileged.hashedPassword` array, and a
+    /// `secret.password` plaintext array (required so homed can derive the LUKS
+    /// home key at create). `storage: "luks"` selects a per-user LUKS home file.
+    /// No signature section: homed signs locally on create and accepts an
+    /// unsigned create credential from the trusted local credstore.
+    pub fn home_create_record(&self) -> String {
+        let mut record = json!({
+            "userName": self.username,
+            "memberOf": ["wheel"],
+            "storage": "luks",
+            "disposition": "regular",
+            "privileged": { "hashedPassword": [self.password_hash] },
+            "secret": { "password": [self.password_plain] },
+        });
+        if !self.realname.is_empty() {
+            record["realName"] = json!(self.realname);
+        }
+        record.to_string()
+    }
+
+    /// Relative path, under the target root, of the first-user credential file:
+    /// `etc/credstore/home.create.<username>`. A later phase writes
+    /// [`home_create_record`](Self::home_create_record) there (mode 0600);
+    /// systemd-homed-firstboot consumes it on first boot.
+    pub fn credstore_relpath(&self) -> String {
+        format!("etc/credstore/home.create.{}", self.username)
+    }
+
+    /// Whether this user is fully specified: valid username, a password hash,
+    /// and the plaintext present. GECOS may be empty. The screen gates
+    /// password confirmation separately.
+    pub fn user_complete(&self) -> bool {
+        valid_username(&self.username)
+            && valid_gecos(&self.realname)
+            && !self.password_hash.is_empty()
+            && !self.password_plain.is_empty()
+    }
+}
+
 /// First-boot fields accumulated on the Config screen. The text fields start at
-/// sensible defaults; `root_password_hash` is `None` until the password is
-/// entered, confirmed, and hashed.
+/// sensible defaults; `user` is `None` until the first user is entered,
+/// confirmed, and committed.
 #[derive(Clone)]
 pub struct FirstbootConfig {
     pub keymap: String,
@@ -60,8 +130,8 @@ pub struct FirstbootConfig {
     pub timezone: String,
     pub hostname: String,
     pub chassis: Chassis,
-    /// crypt(3) `$6$` hash of the root password, never the plaintext.
-    pub root_password_hash: Option<String>,
+    /// The initial systemd-homed user; `None` until the screen commits it.
+    pub user: Option<UserConfig>,
     /// The TPM2 unlock PIN for the encrypted root, if the user chose PIN mode
     /// (the default). `Some(pin)` -> the installer re-enrolls the root TPM2
     /// keyslot with `--tpm2-with-pin=yes` + a signed PCR-11 policy and wipes the
@@ -80,7 +150,7 @@ impl Default for FirstbootConfig {
             timezone: "UTC".to_string(),
             hostname: "archetype".to_string(),
             chassis: Chassis::Desktop,
-            root_password_hash: None,
+            user: None,
             tpm_pin: None,
         }
     }
@@ -88,15 +158,17 @@ impl Default for FirstbootConfig {
 
 impl FirstbootConfig {
     /// Build the `systemd-firstboot --root=<root>` argument vector for an
-    /// offline target tree. Empty text fields and a `None` password hash are
-    /// omitted (firstboot leaves an unconfigured setting unprompted under
-    /// `--root`). `--setup-machine-id` is always passed so the installed system
-    /// gets a fresh machine-id rather than inheriting the installer's. `--force`
-    /// is required: the target /etc was just seeded from the factory tree
+    /// offline target tree. Empty text fields are omitted (firstboot leaves an
+    /// unconfigured setting unprompted under `--root`). root is LOCKED: we
+    /// always pass `--root-password-hashed=!*` (the locked-account convention),
+    /// so root has no working login -- the admin path is the wheel homed user.
+    /// `--setup-machine-id` is always passed so the installed system gets a
+    /// fresh machine-id rather than inheriting the installer's. `--force` is
+    /// required: the target /etc was just seeded from the factory tree
     /// (/usr/share/factory/etc ships locale.conf, vconsole.conf, passwd, shadow,
     /// ...), and without --force firstboot silently skips any file that already
-    /// exists -- which would drop the wizard's root password and lock the
-    /// operator out while still reporting success.
+    /// exists -- which would drop the locked-root shadow entry while still
+    /// reporting success.
     pub fn firstboot_args(&self, root: &Path) -> Vec<String> {
         let mut args = vec![format!("--root={}", root.display()), "--force".to_string()];
         let mut push = |flag: &str, value: &str| {
@@ -109,11 +181,7 @@ impl FirstbootConfig {
         push("--keymap", &self.keymap);
         push("--timezone", &self.timezone);
         push("--hostname", &self.hostname);
-        if let Some(hash) = self.root_password_hash.as_deref() {
-            if !hash.is_empty() {
-                args.push(format!("--root-password-hashed={hash}"));
-            }
-        }
+        args.push(format!("--root-password-hashed={LOCKED_PASSWORD_HASH}"));
         args.push("--setup-machine-id".to_string());
         args
     }
@@ -125,19 +193,8 @@ impl FirstbootConfig {
         format!("CHASSIS={}\n", self.chassis.as_str())
     }
 
-    /// The stdin line for `chpasswd -e` that sets root's password on the LIVE
-    /// system to the same hash applied to the target. `None` until a password
-    /// has been entered. Fed via stdin (not argv) so the hash never appears in
-    /// the process list. Newline-terminated.
-    pub fn live_root_chpasswd_entry(&self) -> Option<String> {
-        self.root_password_hash
-            .as_deref()
-            .filter(|hash| !hash.is_empty())
-            .map(|hash| format!("root:{hash}\n"))
-    }
-
     /// Whether every required text field is filled and the hostname is valid.
-    /// Independent of the password, which the screen gates separately.
+    /// Independent of the user, which the screen gates separately.
     pub fn fields_complete(&self) -> bool {
         !self.keymap.trim().is_empty()
             && !self.locale.trim().is_empty()
@@ -162,13 +219,43 @@ pub fn valid_hostname(hostname: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// Hash `plaintext` into a crypt(3) `$6$` SHA-512 string for
-/// `systemd-firstboot --root-password-hashed=`. A random salt is generated per
-/// call.
-pub fn hash_root_password(plaintext: &str) -> Result<String> {
+/// Hash `plaintext` into a crypt(3) `$6$` SHA-512 string (for a user record's
+/// `privileged.hashedPassword`). A random salt is generated per call.
+pub fn hash_password(plaintext: &str) -> Result<String> {
     let params = Sha512Params::new(ROUNDS_DEFAULT)
         .map_err(|err| anyhow!("invalid sha512 params: {err:?}"))?;
     sha512_simple(plaintext, &params).map_err(|err| anyhow!("failed to hash password: {err:?}"))
+}
+
+/// A valid UNIX username following the useradd convention: first char a
+/// lowercase letter or `_`, then lowercase letters, digits, `_`, or `-`;
+/// length 1..=32. Rejects uppercase, an all-numeric name, and a trailing `-`.
+/// Used by the Phase-2 screen.
+#[allow(dead_code)]
+pub fn valid_username(username: &str) -> bool {
+    let len = username.len();
+    if !(1..=32).contains(&len) {
+        return false;
+    }
+    if username.ends_with('-') {
+        return false;
+    }
+    let mut chars = username.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// A valid GECOS / full-name field: no control chars, no `:` (the passwd/shadow
+/// delimiter), no newline. Empty is allowed (the record omits `realName`).
+/// Used by the Phase-2 screen.
+#[allow(dead_code)]
+pub fn valid_gecos(gecos: &str) -> bool {
+    gecos
+        .chars()
+        .all(|c| !c.is_control() && c != ':' && c != '\n')
 }
 
 #[cfg(test)]
@@ -178,7 +265,7 @@ mod tests {
 
     #[test]
     fn hash_is_sha512_crypt_and_round_trips() {
-        let hash = hash_root_password("correct horse battery staple").unwrap();
+        let hash = hash_password("correct horse battery staple").unwrap();
         assert!(
             hash.starts_with("$6$"),
             "hash must be a $6$ SHA-512 crypt string: {hash}"
@@ -189,9 +276,89 @@ mod tests {
 
     #[test]
     fn distinct_salts_yield_distinct_hashes() {
-        let a = hash_root_password("same").unwrap();
-        let b = hash_root_password("same").unwrap();
+        let a = hash_password("same").unwrap();
+        let b = hash_password("same").unwrap();
         assert_ne!(a, b, "a random salt per call should make hashes differ");
+    }
+
+    fn sample_user() -> UserConfig {
+        UserConfig {
+            username: "alice".to_string(),
+            realname: "Alice Example".to_string(),
+            password_hash: "$6$salt$hash".to_string(),
+            password_plain: "hunter2hunter2".to_string(),
+        }
+    }
+
+    #[test]
+    fn home_create_record_matches_user_record_schema() {
+        let json: serde_json::Value =
+            serde_json::from_str(&sample_user().home_create_record()).unwrap();
+        assert_eq!(json["userName"], "alice");
+        assert_eq!(json["realName"], "Alice Example");
+        assert_eq!(json["disposition"], "regular");
+        assert_eq!(json["storage"], "luks");
+        assert_eq!(json["memberOf"], serde_json::json!(["wheel"]));
+        assert_eq!(json["privileged"]["hashedPassword"][0], "$6$salt$hash");
+        assert_eq!(json["secret"]["password"][0], "hunter2hunter2");
+    }
+
+    #[test]
+    fn home_create_record_omits_empty_realname() {
+        let mut user = sample_user();
+        user.realname.clear();
+        let json: serde_json::Value = serde_json::from_str(&user.home_create_record()).unwrap();
+        assert!(json.get("realName").is_none());
+    }
+
+    #[test]
+    fn credstore_relpath_names_the_credential() {
+        assert_eq!(
+            sample_user().credstore_relpath(),
+            "etc/credstore/home.create.alice"
+        );
+    }
+
+    #[test]
+    fn user_complete_requires_valid_name_and_secrets() {
+        let mut user = sample_user();
+        assert!(user.user_complete());
+        user.password_plain.clear();
+        assert!(!user.user_complete());
+        let mut user = sample_user();
+        user.username = "Bad".to_string();
+        assert!(!user.user_complete());
+    }
+
+    #[test]
+    fn valid_username_accepts_useradd_names() {
+        assert!(valid_username("alice"));
+        assert!(valid_username("_svc"));
+        assert!(valid_username("a"));
+        assert!(valid_username("user-01_x"));
+        assert!(valid_username(&"a".repeat(32)));
+    }
+
+    #[test]
+    fn valid_username_rejects_bad_names() {
+        assert!(!valid_username(""));
+        assert!(!valid_username("Alice"));
+        assert!(!valid_username("1abc"));
+        assert!(!valid_username("123"));
+        assert!(!valid_username("-leading"));
+        assert!(!valid_username("trailing-"));
+        assert!(!valid_username("has space"));
+        assert!(!valid_username("dotted.name"));
+        assert!(!valid_username(&"a".repeat(33)));
+    }
+
+    #[test]
+    fn valid_gecos_accepts_names_and_empty_rejects_delimiters() {
+        assert!(valid_gecos("Alice Example"));
+        assert!(valid_gecos(""));
+        assert!(!valid_gecos("has:colon"));
+        assert!(!valid_gecos("has\nnewline"));
+        assert!(!valid_gecos("tab\there"));
     }
 
     #[test]
@@ -228,7 +395,7 @@ mod tests {
             timezone: "UTC".to_string(),
             hostname: "archetype".to_string(),
             chassis: Chassis::Desktop,
-            root_password_hash: Some("$6$salt$hash".to_string()),
+            user: Some(sample_user()),
             tpm_pin: None,
         };
         let args = config.firstboot_args(Path::new("/run/archetype-install/target"));
@@ -242,7 +409,7 @@ mod tests {
                 "--keymap=us",
                 "--timezone=UTC",
                 "--hostname=archetype",
-                "--root-password-hashed=$6$salt$hash",
+                "--root-password-hashed=!*",
                 "--setup-machine-id",
             ]
         );
@@ -256,7 +423,7 @@ mod tests {
             timezone: "UTC".to_string(),
             hostname: String::new(),
             chassis: Chassis::Server,
-            root_password_hash: None,
+            user: None,
             tpm_pin: None,
         };
         let args = config.firstboot_args(Path::new("/mnt"));
@@ -266,10 +433,10 @@ mod tests {
                 "--root=/mnt",
                 "--force",
                 "--timezone=UTC",
+                "--root-password-hashed=!*",
                 "--setup-machine-id"
             ]
         );
-        assert!(!args.iter().any(|a| a.starts_with("--root-password-hashed")));
         assert!(!args.iter().any(|a| a.starts_with("--keymap")));
         assert!(!args.iter().any(|a| a.starts_with("--locale")));
         assert!(!args.iter().any(|a| a.starts_with("--hostname")));
@@ -285,16 +452,9 @@ mod tests {
     }
 
     #[test]
-    fn live_chpasswd_entry_present_only_with_a_hash() {
-        let mut config = FirstbootConfig::default();
-        assert_eq!(config.live_root_chpasswd_entry(), None);
-        config.root_password_hash = Some("$6$salt$hash".to_string());
-        assert_eq!(
-            config.live_root_chpasswd_entry().as_deref(),
-            Some("root:$6$salt$hash\n")
-        );
-        config.root_password_hash = Some(String::new());
-        assert_eq!(config.live_root_chpasswd_entry(), None);
+    fn firstboot_args_always_lock_root() {
+        let args = FirstbootConfig::default().firstboot_args(Path::new("/mnt"));
+        assert!(args.contains(&"--root-password-hashed=!*".to_string()));
     }
 
     #[test]

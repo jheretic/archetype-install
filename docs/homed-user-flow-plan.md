@@ -29,8 +29,24 @@ step) — dropping it removes all of that. There is NO homed recovery key in v1
   enable systemd-homed.service`) and the `systemd-homed` binary ships in Arch's
   base `systemd` package (already in the image). Phase 4 verifies the image
   build actually applies the preset (not masked).
-- Password stays a crypt(3) `$6$` SHA-512 hash (reuse `hash_root_password`),
-  embedded in the user record JSON.
+- Password: the user record needs BOTH `privileged.hashedPassword` (crypt(3)
+  `$6$`, for auth) AND `secret.password` (PLAINTEXT array) — homed requires the
+  plaintext at CREATE time to derive the LUKS home encryption key
+  (USER_RECORD.md: the `secret` section carries the plaintext password "as
+  passwords... need to be provided to encrypt the home directory with").
+  hashedPassword alone cannot encrypt the home.
+- SECURITY NOTE (decided: plaintext-on-encrypted-root): the staged
+  `/etc/credstore/home.create.<user>` therefore contains the PLAINTEXT password
+  until first boot consumes it. This is acceptable because the target's
+  `/etc/credstore/` lives on the LUKS+TPM-encrypted root partition (protected at
+  rest), the credential is consumed once (`ConditionFirstBoot=yes`), and this is
+  the standard systemd first-boot-user-creation pattern. Write it 0600. (The
+  encrypted-credstore alternative would need the target's TPM sealed at install
+  time — more complexity for marginal gain since root is already encrypted.)
+  The record's `regular`/`privileged` sections carry userName/realName/
+  memberOf=[wheel]/storage=luks + hashedPassword; `secret.password` carries the
+  plaintext. No signature section (homed signs locally on create; an unsigned
+  create credential is accepted from the trusted local credstore).
 
 ## Storage backend: nested LUKS-file (DECIDED)
 

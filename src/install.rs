@@ -295,6 +295,7 @@ fn post_steps(plan: &InstallPlan, tx: &Sender<Progress>) -> Result<(), String> {
     let root_mount = Path::new(TARGET_MOUNT);
     let rest = apply_firstboot(&plan.firstboot, root_mount, tx)
         .and_then(|()| write_machine_info(&plan.firstboot, root_mount, tx))
+        .and_then(|()| write_machine_id(root_mount, tx))
         .and_then(|()| stage_user_credential(&plan.firstboot, root_mount, tx))
         .and_then(|()| integrity_home(plan, &parts, root_mount, tx))
         .and_then(|()| setup_swap(&parts, root_mount, tx))
@@ -494,6 +495,28 @@ fn write_machine_info(
     let path = root_mount.join("etc/machine-info");
     log(tx, &format!("writing {}", path.display()));
     std::fs::write(&path, firstboot.machine_info())
+        .map_err(|err| format!("could not write {}: {err}", path.display()))
+}
+
+/// The literal systemd writes to `/etc/machine-id` to mark a not-yet-provisioned
+/// system. machine-id(5) First Boot Semantics: this string (or a MISSING file)
+/// makes the next boot a first boot; an EMPTY file does NOT. We assert it
+/// positively rather than leaving the file absent so a stray factory seed that
+/// drops an empty machine-id can't silently turn off first boot.
+const MACHINE_ID_UNINITIALIZED: &str = "uninitialized\n";
+
+/// Write `<target>/etc/machine-id` = `uninitialized\n` so the installed system's
+/// first boot IS a first boot: PID1 then generates the real machine-id and, more
+/// importantly, runs the `ConditionFirstBoot=yes` units -- systemd-homed-firstboot
+/// creates the wheel user from the staged credential. If this file instead held a
+/// real machine-id (as `systemd-firstboot --setup-machine-id` would write), first
+/// boot would be suppressed, the user never created, and locked root = brick.
+/// Required step: overwrite any factory-seeded value.
+fn write_machine_id(root_mount: &Path, tx: &Sender<Progress>) -> Result<(), String> {
+    let _ = tx.send(Progress::Step("Marking first-boot machine-id".to_string()));
+    let path = root_mount.join("etc/machine-id");
+    log(tx, &format!("writing {} (uninitialized)", path.display()));
+    std::fs::write(&path, MACHINE_ID_UNINITIALIZED)
         .map_err(|err| format!("could not write {}: {err}", path.display()))
 }
 
@@ -2012,6 +2035,30 @@ mod tests {
         let none = FirstbootConfig::default();
         assert!(stage_user_credential(&none, &dir, &tx).is_err());
         assert!(!dir.join("etc/credstore").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_machine_id_marks_uninitialized_first_boot() {
+        // The exact string matters: machine-id(5) treats "uninitialized" (or a
+        // missing file) as first boot, but an EMPTY file as NOT first boot. A
+        // regression to empty would silently skip homed-firstboot -> no user ->
+        // brick, so assert the literal content.
+        let dir = std::env::temp_dir().join(format!("archetype-mid-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        // A pre-existing real id (as --setup-machine-id would leave) must be
+        // overwritten back to the first-boot marker.
+        std::fs::write(
+            dir.join("etc/machine-id"),
+            "0123456789abcdef0123456789abcdef\n",
+        )
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        write_machine_id(&dir, &tx).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("etc/machine-id")).unwrap(),
+            "uninitialized\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

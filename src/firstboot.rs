@@ -168,8 +168,14 @@ impl FirstbootConfig {
     /// unconfigured setting unprompted under `--root`). root is LOCKED: we
     /// always pass `--root-password-hashed=!*` (the locked-account convention),
     /// so root has no working login -- the admin path is the wheel homed user.
-    /// `--setup-machine-id` is always passed so the installed system gets a
-    /// fresh machine-id rather than inheriting the installer's. `--force` is
+    /// We deliberately do NOT pass `--setup-machine-id`: committing a real
+    /// machine-id makes the installed system's first boot NOT a first boot
+    /// (machine-id(5) First Boot Semantics), which silently skips every
+    /// `ConditionFirstBoot=yes` unit -- including systemd-homed-firstboot, so
+    /// the wheel user would never be created and locked root = brick. Instead
+    /// the target `/etc/machine-id` is left in the `uninitialized` first-boot
+    /// state (see `write_machine_id` in install.rs); PID1 generates the real id
+    /// during that first boot. `--force` is
     /// required: the target /etc was just seeded from the factory tree
     /// (/usr/share/factory/etc ships locale.conf, vconsole.conf, passwd, shadow,
     /// ...), and without --force firstboot silently skips any file that already
@@ -188,7 +194,6 @@ impl FirstbootConfig {
         push("--timezone", &self.timezone);
         push("--hostname", &self.hostname);
         args.push(format!("--root-password-hashed={LOCKED_PASSWORD_HASH}"));
-        args.push("--setup-machine-id".to_string());
         args
     }
 
@@ -481,7 +486,6 @@ mod tests {
                 "--timezone=UTC",
                 "--hostname=archetype",
                 "--root-password-hashed=!*",
-                "--setup-machine-id",
             ]
         );
     }
@@ -505,7 +509,6 @@ mod tests {
                 "--force",
                 "--timezone=UTC",
                 "--root-password-hashed=!*",
-                "--setup-machine-id"
             ]
         );
         assert!(!args.iter().any(|a| a.starts_with("--keymap")));

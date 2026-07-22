@@ -1,12 +1,14 @@
 //! System configuration: collect the first-boot fields (keymap, locale,
-//! timezone, hostname, chassis) and the root password.
+//! timezone, hostname, chassis) and the homed user (username, full name,
+//! password).
 //!
 //! A cursor selects one field. Text fields take typed input; the chassis field
 //! cycles left/right within {desktop, laptop, server}; the two password fields
 //! are masked. Advancing is gated on every text field being filled, the
-//! hostname being valid, and the two passwords being non-empty and equal. On
-//! advance the password is hashed into the config and the typed buffers are
-//! cleared, so plaintext never outlives this screen.
+//! hostname being valid, the username/full name being valid, and the two
+//! passwords being non-empty and equal. On advance the password is hashed into
+//! the config and the typed buffers are cleared, so plaintext never outlives
+//! this screen.
 //!
 //! Like the Confirm screen, `q` is NOT a quit key here -- it is a literal
 //! character the user may type. Esc goes back.
@@ -31,6 +33,8 @@ enum Field {
     Timezone,
     Hostname,
     Chassis,
+    Username,
+    Realname,
     Password,
     PasswordConfirm,
     TpmMode,
@@ -40,12 +44,14 @@ enum Field {
 
 /// All fields in display order. The PIN entry/confirm are dropped from the
 /// navigable set in automatic mode (see [`visible_fields`]).
-const ALL_FIELDS: [Field; 10] = [
+const ALL_FIELDS: [Field; 12] = [
     Field::Keymap,
     Field::Locale,
     Field::Timezone,
     Field::Hostname,
     Field::Chassis,
+    Field::Username,
+    Field::Realname,
     Field::Password,
     Field::PasswordConfirm,
     Field::TpmMode,
@@ -112,8 +118,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Transition {
             Transition::Stay
         }
         KeyCode::Enter if can_advance(app) => {
-            commit(app);
-            Transition::Next
+            // Only advance if the password actually hashed + the user was
+            // committed; on hash failure stay put (buffers intact) rather than
+            // proceed with no user -> a locked-root brick.
+            if commit(app) {
+                Transition::Next
+            } else {
+                Transition::Stay
+            }
         }
         _ => Transition::Stay,
     }
@@ -127,6 +139,8 @@ fn field_buffer(app: &mut App, field: Field) -> Option<&mut String> {
         Field::Locale => &mut app.config.firstboot.locale,
         Field::Timezone => &mut app.config.firstboot.timezone,
         Field::Hostname => &mut app.config.firstboot.hostname,
+        Field::Username => &mut app.username,
+        Field::Realname => &mut app.realname,
         Field::Password => &mut app.password,
         Field::PasswordConfirm => &mut app.password_confirm,
         Field::TpmPin => &mut app.tpm_pin,
@@ -146,35 +160,50 @@ fn tpm_pin_ok(app: &App) -> bool {
     !app.tpm_pin_mode || (!app.tpm_pin.is_empty() && app.tpm_pin == app.tpm_pin_confirm)
 }
 
-/// Whether the screen may advance: all text fields valid, passwords matched,
-/// and (in PIN mode) the PIN confirmed.
+/// Whether the user identity fields are acceptable: a valid UNIX username and a
+/// valid (possibly empty) full name/GECOS.
+fn user_fields_ok(app: &App) -> bool {
+    firstboot::valid_username(&app.username) && firstboot::valid_gecos(&app.realname)
+}
+
+/// Whether the screen may advance: all text fields valid, the user identity
+/// valid, passwords matched, and (in PIN mode) the PIN confirmed.
 fn can_advance(app: &App) -> bool {
-    app.config.firstboot.fields_complete() && passwords_match(app) && tpm_pin_ok(app)
+    app.config.firstboot.fields_complete()
+        && user_fields_ok(app)
+        && passwords_match(app)
+        && tpm_pin_ok(app)
 }
 
 /// Hash the confirmed password into the config, move the PIN (PIN mode only)
 /// into the config, and clear all plaintext buffers. Only called once
 /// [`can_advance`] holds.
-fn commit(app: &mut App) {
-    // TODO(phase2): collect username + GECOS on the screen. For now build a
-    // placeholder UserConfig from the password buffers so the crate compiles.
-    if let Ok(hash) = firstboot::hash_password(&app.password) {
-        app.config.firstboot.user = Some(firstboot::UserConfig {
-            username: String::new(),
-            realname: String::new(),
-            password_hash: hash,
-            password_plain: app.password.clone(),
-        });
-    }
+/// Commit the screen's fields into the config. Returns `false` (committing
+/// nothing, leaving buffers intact for retry) if the password fails to hash, so
+/// the caller does NOT advance with a `None` user (which would brick the
+/// install: root is locked and no login user would be created).
+fn commit(app: &mut App) -> bool {
+    let Ok(hash) = firstboot::hash_password(&app.password) else {
+        return false;
+    };
+    app.config.firstboot.user = Some(firstboot::UserConfig {
+        username: app.username.clone(),
+        realname: app.realname.clone(),
+        password_hash: hash,
+        password_plain: app.password.clone(),
+    });
     app.config.firstboot.tpm_pin = if app.tpm_pin_mode {
         Some(app.tpm_pin.clone())
     } else {
         None
     };
+    app.username.clear();
+    app.realname.clear();
     app.password.clear();
     app.password_confirm.clear();
     app.tpm_pin.clear();
     app.tpm_pin_confirm.clear();
+    true
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -207,6 +236,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(1),        // hostname
             Constraint::Length(1),        // chassis
             Constraint::Length(1),        // spacer
+            Constraint::Length(1),        // username
+            Constraint::Length(1),        // realname
             Constraint::Length(1),        // password
             Constraint::Length(1),        // password confirm
             Constraint::Length(1),        // spacer
@@ -236,8 +267,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(chassis_field(app), rows[4]);
     frame.render_widget(
-        password_field(app, Field::Password, "root password", &app.password),
+        text_field(app, Field::Username, "username", &app.username),
         rows[6],
+    );
+    frame.render_widget(
+        text_field(app, Field::Realname, "full name", &app.realname),
+        rows[7],
+    );
+    frame.render_widget(
+        password_field(app, Field::Password, "password", &app.password),
+        rows[8],
     );
     frame.render_widget(
         password_field(
@@ -246,14 +285,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
             "confirm",
             &app.password_confirm,
         ),
-        rows[7],
+        rows[9],
     );
-    frame.render_widget(tpm_mode_field(app), rows[9]);
+    frame.render_widget(tpm_mode_field(app), rows[11]);
     if app.tpm_pin_mode {
         let pin_area = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(rows[10]);
+            .split(rows[12]);
         frame.render_widget(
             password_field(app, Field::TpmPin, "TPM PIN", &app.tpm_pin),
             pin_area[0],
@@ -268,12 +307,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
             pin_area[1],
         );
     } else {
-        frame.render_widget(tpm_auto_warning(), rows[10]);
+        frame.render_widget(tpm_auto_warning(), rows[12]);
     }
-    frame.render_widget(Paragraph::new(status(app)), rows[11]);
+    frame.render_widget(Paragraph::new(status(app)), rows[13]);
     frame.render_widget(
         Paragraph::new(hint()).alignment(Alignment::Center),
-        rows[12],
+        rows[14],
     );
 }
 
@@ -387,8 +426,18 @@ fn status(app: &App) -> Line<'static> {
         ("hostname must be 1-63 DNS chars (a-z, 0-9, -)", theme::RED)
     } else if !app.config.firstboot.fields_complete() {
         ("keymap, locale, and timezone must not be empty", theme::RED)
+    } else if !firstboot::valid_username(&app.username) {
+        (
+            "username: 1-32 chars, start a-z or _, then a-z 0-9 _ -",
+            theme::RED,
+        )
+    } else if !firstboot::valid_gecos(&app.realname) {
+        (
+            "full name must not contain ':' or control characters",
+            theme::RED,
+        )
     } else if app.password.is_empty() {
-        ("set a root password", theme::YELLOW)
+        ("set a user password", theme::YELLOW)
     } else if app.password != app.password_confirm {
         ("passwords do not match", theme::RED)
     } else if app.tpm_pin_mode && app.tpm_pin.is_empty() {
@@ -435,6 +484,8 @@ mod tests {
 
     fn typed_app() -> App {
         let mut app = App::new(true);
+        app.username = "alice".to_string();
+        app.realname = "Alice Example".to_string();
         app.password = "hunter2hunter2".to_string();
         app.password_confirm = "hunter2hunter2".to_string();
         // Default mode is PIN, so a matching PIN is required to advance.
@@ -519,5 +570,28 @@ mod tests {
         assert!(user.password_hash.starts_with("$6$"));
         assert!(app.password.is_empty());
         assert!(app.password_confirm.is_empty());
+    }
+
+    #[test]
+    fn commit_populates_user_identity_and_clears_buffers() {
+        let mut app = typed_app();
+        assert!(can_advance(&app));
+        commit(&mut app);
+        let user = app.config.firstboot.user.as_ref().unwrap();
+        assert_eq!(user.username, "alice");
+        assert_eq!(user.realname, "Alice Example");
+        assert_eq!(user.password_plain, "hunter2hunter2");
+        assert!(user.password_hash.starts_with("$6$"));
+        assert!(app.username.is_empty());
+        assert!(app.realname.is_empty());
+    }
+
+    #[test]
+    fn invalid_username_blocks_advancing() {
+        let mut app = typed_app();
+        app.username = "Bad Name".to_string();
+        assert!(!can_advance(&app));
+        app.username.clear();
+        assert!(!can_advance(&app));
     }
 }

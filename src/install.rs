@@ -135,6 +135,13 @@ impl InstallPlan {
         if typed_name != chosen_device {
             return None;
         }
+        // A real install MUST have a complete first user: root is locked, so
+        // authorizing an install with no valid login user would brick the disk.
+        // (Dry-run returned above; this guards the destructive path only.)
+        match firstboot.user.as_ref() {
+            Some(user) if user.user_complete() => {}
+            _ => return None,
+        }
         Some(Self {
             device: chosen_device.to_string(),
             definitions_dir: PathBuf::from(OUTPUT_DIR),
@@ -288,6 +295,7 @@ fn post_steps(plan: &InstallPlan, tx: &Sender<Progress>) -> Result<(), String> {
     let root_mount = Path::new(TARGET_MOUNT);
     let rest = apply_firstboot(&plan.firstboot, root_mount, tx)
         .and_then(|()| write_machine_info(&plan.firstboot, root_mount, tx))
+        .and_then(|()| stage_user_credential(&plan.firstboot, root_mount, tx))
         .and_then(|()| integrity_home(plan, &parts, root_mount, tx))
         .and_then(|()| setup_swap(&parts, root_mount, tx))
         .and_then(|()| populate_esp(&parts, tx))
@@ -487,6 +495,48 @@ fn write_machine_info(
     log(tx, &format!("writing {}", path.display()));
     std::fs::write(&path, firstboot.machine_info())
         .map_err(|err| format!("could not write {}: {err}", path.display()))
+}
+
+/// Stage the systemd-homed first-user credential on the target so first boot
+/// creates the wheel user (root is locked, so this is the only admin path). The
+/// credential goes to `<target>/etc/credstore/home.create.<username>`: the
+/// credstore dir is 0700 and the file 0600 because the record's `secret.password`
+/// carries the PLAINTEXT password homed needs to derive the LUKS home key. The
+/// target root is LUKS+TPM encrypted at rest and the credential is consumed once
+/// (`ConditionFirstBoot=yes`). Required step: without it first boot has no login
+/// user and locked root = lockout, so a failure aborts the install. The record
+/// CONTENTS are never logged (they hold the plaintext); only the path is.
+fn stage_user_credential(
+    firstboot: &FirstbootConfig,
+    root_mount: &Path,
+    tx: &Sender<Progress>,
+) -> Result<(), String> {
+    let _ = tx.send(Progress::Step("Staging first-user credential".to_string()));
+    // A missing or incomplete user is a HARD ERROR, not a skip: root is locked,
+    // so an install that finishes with no login credential is an unrecoverable
+    // brick. Fail closed (Outcome::Incomplete) rather than report success.
+    let user = firstboot
+        .user
+        .as_ref()
+        .ok_or_else(|| "no first user configured; refusing to finish (root is locked, this would brick the install)".to_string())?;
+    if !user.user_complete() {
+        return Err("first-user config is incomplete (invalid username or empty password); refusing to stage a credential that would leave root locked with no login".to_string());
+    }
+    let path = root_mount.join(user.credstore_relpath());
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    set_mode(dir, 0o700)?;
+
+    std::fs::write(&path, user.home_create_record())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    set_mode(&path, 0o600)?;
+    log(
+        tx,
+        &format!("wrote user credential {} (0600)", path.display()),
+    );
+    Ok(())
 }
 
 /// TPM2-unlock the LUKS2 root via `systemd-cryptsetup attach`. The KEY-FILE
@@ -1551,7 +1601,17 @@ mod tests {
     use crate::firstboot::FirstbootConfig;
 
     fn fb() -> FirstbootConfig {
-        FirstbootConfig::default()
+        // A complete first user, as the real screen produces — authorize() now
+        // requires one for a non-dry-run install (locked root + no user = brick).
+        FirstbootConfig {
+            user: Some(crate::firstboot::UserConfig {
+                username: "alice".to_string(),
+                realname: "Alice Example".to_string(),
+                password_hash: "$6$salt$hash".to_string(),
+                password_plain: "pw".to_string(),
+            }),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1640,6 +1700,24 @@ mod tests {
         let plan = InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb", fb(), false)
             .expect("should authorize");
         assert!(!plan.home_requested);
+    }
+
+    #[test]
+    fn authorize_rejects_missing_or_incomplete_user() {
+        // No user -> would brick (locked root, no login). Reject.
+        let none = FirstbootConfig::default();
+        assert!(InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb", none, true).is_none());
+        // Invalid username -> incomplete. Reject.
+        let bad = FirstbootConfig {
+            user: Some(crate::firstboot::UserConfig {
+                username: "Bad Name".to_string(),
+                realname: String::new(),
+                password_hash: "$6$salt$hash".to_string(),
+                password_plain: "pw".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert!(InstallPlan::authorize(false, "/dev/sdb", "/dev/sdb", bad, true).is_none());
     }
 
     #[test]
@@ -1884,6 +1962,56 @@ mod tests {
         write_integrity_key(&path, &[0u8; HOME_KEY_SIZE]).expect("should write key");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_user_credential_writes_0600_record_in_0700_credstore() {
+        use crate::firstboot::UserConfig;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("archetype-cred-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = UserConfig {
+            username: "alice".to_string(),
+            realname: "Alice Example".to_string(),
+            password_hash: "$6$salt$hash".to_string(),
+            password_plain: "hunter2hunter2".to_string(),
+        };
+        let firstboot = FirstbootConfig {
+            user: Some(user),
+            ..FirstbootConfig::default()
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        stage_user_credential(&firstboot, &dir, &tx).unwrap();
+
+        let cred = dir.join("etc/credstore/home.create.alice");
+        let credstore = dir.join("etc/credstore");
+        assert!(cred.exists(), "credential file should exist at {cred:?}");
+        assert_eq!(
+            std::fs::metadata(&credstore).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&cred).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cred).unwrap()).unwrap();
+        assert_eq!(json["userName"], "alice");
+        assert_eq!(json["secret"]["password"][0], "hunter2hunter2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_user_credential_errors_without_a_user() {
+        // A None user is a HARD ERROR now (locked root + no login = brick), not
+        // a silent skip. It must fail and write nothing.
+        let dir = std::env::temp_dir().join(format!("archetype-cred-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let none = FirstbootConfig::default();
+        assert!(stage_user_credential(&none, &dir, &tx).is_err());
+        assert!(!dir.join("etc/credstore").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -92,6 +92,12 @@ impl UserConfig {
             "memberOf": ["wheel"],
             "storage": "luks",
             "disposition": "regular",
+            // Disable homed's password-quality check at create time: the screen
+            // already accepts any non-empty password, and without this homed may
+            // REJECT a "weak" one and fall back to an interactive prompt, leaving
+            // root locked and no user on a headless install. Matches what
+            // systemd's own `homectl firstboot` sets.
+            "enforcePasswordPolicy": false,
             "privileged": { "hashedPassword": [self.password_hash] },
             "secret": { "password": [self.password_plain] },
         });
@@ -230,14 +236,21 @@ pub fn hash_password(plaintext: &str) -> Result<String> {
 /// A valid UNIX username following the useradd convention: first char a
 /// lowercase letter or `_`, then lowercase letters, digits, `_`, or `-`;
 /// length 1..=32. Rejects uppercase, an all-numeric name, and a trailing `-`.
-/// Used by the Phase-2 screen.
-#[allow(dead_code)]
 pub fn valid_username(username: &str) -> bool {
+    // Max 31: systemd's strict validator caps at sizeof(utmpx.ut_user)-1 = 31
+    // (src/basic/user-util.c). A 32-char name would pass a naive check here but
+    // be SKIPPED by homed at first boot -> locked root, no user. So reject it.
     let len = username.len();
-    if !(1..=32).contains(&len) {
+    if !(1..=31).contains(&len) {
         return false;
     }
     if username.ends_with('-') {
+        return false;
+    }
+    // Reject names that already exist in the seeded target (homed refuses to
+    // create a user/group that collides -> the credential is silently skipped
+    // -> lockout). These are the accounts/groups the base image ships.
+    if RESERVED_NAMES.contains(&username) {
         return false;
     }
     let mut chars = username.chars();
@@ -248,10 +261,59 @@ pub fn valid_username(username: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
+/// Names that already exist in the base image's passwd/group and would make
+/// systemd-homed refuse to create the user (a name collision skips the
+/// credential at first boot). Not exhaustive of every possible NSS entry, but
+/// covers root + the standard system accounts/groups an Arch base ships, so the
+/// common footguns (root, wheel, nobody, ...) are rejected in the installer
+/// rather than silently bricking at first boot.
+const RESERVED_NAMES: &[&str] = &[
+    "root",
+    "wheel",
+    "nobody",
+    "nobody4",
+    "daemon",
+    "bin",
+    "sys",
+    "adm",
+    "tty",
+    "disk",
+    "lp",
+    "mem",
+    "kmem",
+    "mail",
+    "news",
+    "uucp",
+    "man",
+    "proxy",
+    "kvm",
+    "games",
+    "ftp",
+    "http",
+    "dbus",
+    "systemd-journal",
+    "systemd-network",
+    "systemd-resolve",
+    "systemd-timesync",
+    "systemd-coredump",
+    "systemd-oom",
+    "systemd-homed",
+    "polkitd",
+    "audio",
+    "video",
+    "render",
+    "input",
+    "users",
+    "utmp",
+    "storage",
+    "optical",
+    "network",
+    "power",
+    "sudo",
+];
+
 /// A valid GECOS / full-name field: no control chars, no `:` (the passwd/shadow
 /// delimiter), no newline. Empty is allowed (the record omits `realName`).
-/// Used by the Phase-2 screen.
-#[allow(dead_code)]
 pub fn valid_gecos(gecos: &str) -> bool {
     gecos
         .chars()
@@ -336,7 +398,16 @@ mod tests {
         assert!(valid_username("_svc"));
         assert!(valid_username("a"));
         assert!(valid_username("user-01_x"));
-        assert!(valid_username(&"a".repeat(32)));
+        assert!(valid_username(&"a".repeat(31))); // 31 = utmpx max, accepted
+    }
+
+    #[test]
+    fn valid_username_rejects_over_31_and_reserved() {
+        assert!(!valid_username(&"a".repeat(32))); // homed skips >31 -> lockout
+        assert!(!valid_username("root")); // collides with seeded accounts
+        assert!(!valid_username("wheel"));
+        assert!(!valid_username("nobody"));
+        assert!(!valid_username("sudo"));
     }
 
     #[test]

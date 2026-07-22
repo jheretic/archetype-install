@@ -105,7 +105,11 @@ pub struct App {
     /// sizing screen renders the buffer with a cursor and commits it on Enter.
     pub sizing_edit: Option<String>,
     pub firstboot_cursor: usize,
-    /// Masked root password entry; never persisted. Cleared after hashing.
+    /// The homed user's login name and full name/GECOS. Moved into the config
+    /// on commit and cleared.
+    pub username: String,
+    pub realname: String,
+    /// Masked user password entry; never persisted. Cleared after hashing.
     pub password: String,
     pub password_confirm: String,
     /// TPM2 unlock mode: true = PIN (default, hardened), false = automatic
@@ -148,6 +152,8 @@ impl App {
             sizing_cursor: 0,
             sizing_edit: None,
             firstboot_cursor: 0,
+            username: String::new(),
+            realname: String::new(),
             password: String::new(),
             password_confirm: String::new(),
             tpm_pin_mode: true,
@@ -240,9 +246,9 @@ impl App {
             Screen::Preflight => Screen::Welcome,
             Screen::Welcome => Screen::Config,
             Screen::Config => {
-                // TODO(phase3): root is now LOCKED and the admin path is the
-                // homed wheel user; there is no live root password to set here.
-                // Phase 3 wires the credstore write in install.rs.
+                // Root is LOCKED; the admin path is the homed wheel user. The
+                // credential is written to the target credstore during install
+                // (install.rs stage_user_credential), not here.
                 self.load_disks();
                 Screen::DiskSelect
             }

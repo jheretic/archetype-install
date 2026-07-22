@@ -107,7 +107,13 @@ validation, root-lock arg, credential file contents).
   TPM-PIN steps unchanged.
 - **Phase 4 — image (archetype-build):** add `sudo` to Packages=; ship the wheel
   sudoers dropin; VERIFY systemd-homed.service is enabled in the built image
-  (preset applied, not masked) so first boot consumes the credential.
+  (preset applied, not masked) so first boot consumes the credential. ALSO
+  (deferred from the Phase 2/3 review, major #5): `ImportCredential=` COPIES the
+  credential — PID1/homectl do NOT unlink the `/etc/credstore/home.create.<user>`
+  source, so the plaintext password lingers on the (encrypted, 0600) root after
+  first boot. Add a one-shot/drop-in ordered AFTER
+  `systemd-homed-firstboot.service` SUCCEEDS that removes the source (keep it on
+  FAILURE for retry). Cleanup hygiene, not an acute leak.
 - **Phase 5 — docs + validation notes.** Document the flow; enumerate the
   VM-validation items (first boot creates the user, wheel/sudo works, root is
   locked, login with the password).
